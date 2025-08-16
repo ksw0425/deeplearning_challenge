@@ -1,21 +1,11 @@
-
 """
-valpipe_utils.py
-- Step 3: Stratified data split (train/dev)
+valpipe_utils.py  (v2)
+- Step 3: Stratified data split (train/dev) + optional dev cap per task
 - Step 4: Task-wise metrics + overall equal-weight score
-Designed to be stable (no frequent changes). Import and call from your notebook.
+- NEW: Balanced subsampling utilities to shorten inference time (keep input_type ratio)
 
 Assumed columns in your dataset:
     id, task, input_type, input, question, output
-
-Metrics:
-    Captioning     -> CLIPScore (torchmetrics, openai/clip-vit-base-patch16)
-    VQA            -> Accuracy (normalize: lower/strip/punct removed/space collapse)
-    Math reasoning -> Exact Match on final number (#### <number>), numeric normalization
-    In-context QA  -> Accuracy (same normalization)
-    Summarization  -> BERTScore (F1) (evaluate, default model)
-
-All functions are CPU/GPU agnostic; heavy models are loaded only when metric functions are called.
 """
 
 from __future__ import annotations
@@ -27,15 +17,12 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 import torch
-
-# ---- Optional deps are imported inside metric functions to avoid overhead if unused ----
-# from torchmetrics.multimodal import CLIPScore
-# import evaluate
 from torchvision import transforms
 
 __all__ = [
     "safe_to_csv_utf8", "assert_utf8_ok",
     "stratified_split_by_task", "save_splits",
+    "sample_per_task", "cap_per_task",
     "normalize_answer", "extract_math_final_number", "norm_num",
     "metric_caption_clipscore", "metric_accuracy", "metric_math_em", "metric_bertscore",
     "evaluate_from_df", "evaluate_from_file", "MetricsResult"
@@ -100,10 +87,36 @@ def norm_num(x: str) -> str:
         return str(x).strip()
 
 # ---------------------------
-# Step 3: Stratified split
+# Internal: proportional allocation helper
+# ---------------------------
+def _alloc_counts(group_sizes: List[int], total: int) -> List[int]:
+    """
+    Largest Remainder Method: proportionally allocate 'total' across buckets of sizes group_sizes.
+    Ensures sum == total and each bucket <= original size.
+    """
+    if total <= 0 or sum(group_sizes) == 0:
+        return [0] * len(group_sizes)
+    props = np.array(group_sizes, dtype=float) / float(sum(group_sizes))
+    raw = props * total
+    base = np.floor(raw).astype(int).tolist()
+    rem = total - sum(base)
+    # distribute leftovers by largest fractional parts
+    fracs = [(i, raw[i] - base[i]) for i in range(len(group_sizes))]
+    fracs.sort(key=lambda x: x[1], reverse=True)
+    for i, _ in fracs:
+        if rem <= 0:
+            break
+        take = min(1, group_sizes[i] - base[i])
+        if take > 0:
+            base[i] += take
+            rem -= take
+    return base
+
+# ---------------------------
+# Step 3: Stratified split (+ optional dev cap)
 # ---------------------------
 def stratified_split_by_task(df: pd.DataFrame, dev_ratio: float = 0.2, seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Per-task stratified 80/20 split (default). Returns (train_df, dev_df)."""
+    """Per-task stratified split. Returns (train_df, dev_df)."""
     rng = np.random.default_rng(seed)
     parts = []
     for t, g in df.groupby(df["task"].str.lower()):
@@ -118,10 +131,47 @@ def stratified_split_by_task(df: pd.DataFrame, dev_ratio: float = 0.2, seed: int
     dev   = pd.concat([p[1] for p in parts if p[0]=="dev"]).sort_index().reset_index(drop=True)
     return train, dev
 
-def save_splits(df: pd.DataFrame, out_dir: str, dev_ratio: float = 0.2, seed: int = 42) -> tuple[str, str]:
-    """Split and save to parquet files. Returns (train_path, dev_path)."""
+def sample_per_task(df: pd.DataFrame, per_task: int, seed: int = 42, keep_input_type_ratio: bool = True) -> pd.DataFrame:
+    """
+    Balanced subsample: pick up to 'per_task' rows from each task.
+    If keep_input_type_ratio=True, preserve input_type proportion within each task.
+    """
+    rng = np.random.default_rng(seed)
+    chunks = []
+    for t, g in df.groupby(df["task"].str.lower(), sort=False):
+        n_take = min(len(g), int(per_task))
+        if n_take <= 0:
+            continue
+        if keep_input_type_ratio and "input_type" in g.columns:
+            # allocate per input_type
+            counts = g["input_type"].str.lower().value_counts()
+            keys = counts.index.tolist()
+            allocs = _alloc_counts([counts[k] for k in keys], n_take)
+            for k, a in zip(keys, allocs):
+                if a > 0:
+                    sub = g[g["input_type"].str.lower() == k].sample(n=a, random_state=int(rng.integers(0, 1<<32)))
+                    chunks.append(sub)
+        else:
+            chunks.append(g.sample(n=n_take, random_state=int(rng.integers(0, 1<<32))))
+    if not chunks:
+        return df.iloc[0:0].copy()
+    out = pd.concat(chunks).reset_index(drop=True)
+    return out
+
+def cap_per_task(df: pd.DataFrame, max_per_task: int, seed: int = 42, keep_input_type_ratio: bool = True) -> pd.DataFrame:
+    """Alias for sample_per_task with clearer intent."""
+    return sample_per_task(df, per_task=max_per_task, seed=seed, keep_input_type_ratio=keep_input_type_ratio)
+
+def save_splits(df: pd.DataFrame, out_dir: str, dev_ratio: float = 0.2, seed: int = 42,
+                dev_max_per_task: Optional[int] = None, keep_input_type_ratio: bool = True) -> tuple[str, str]:
+    """
+    Split and save to parquet files. Optionally cap dev to N per task (keeping input_type ratio).
+    Returns (train_path, dev_path).
+    """
     os.makedirs(out_dir, exist_ok=True)
     train_df, dev_df = stratified_split_by_task(df, dev_ratio=dev_ratio, seed=seed)
+    if dev_max_per_task is not None:
+        dev_df = cap_per_task(dev_df, dev_max_per_task, seed=seed, keep_input_type_ratio=keep_input_type_ratio)
     train_path = os.path.join(out_dir, "train.parquet")
     dev_path   = os.path.join(out_dir, "dev.parquet")
     train_df.to_parquet(train_path, index=False)
