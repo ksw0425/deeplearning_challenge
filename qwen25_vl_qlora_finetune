@@ -261,7 +261,7 @@ def train(args):
         args.base_model,
         trust_remote_code=True,
         quantization_config=bnb_cfg,
-        device_map=None,  # single‑GPU train
+        device_map=None,
     )
 
     # Prepare for k‑bit LoRA (phase 1: LLM‑centric)
