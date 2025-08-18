@@ -19,6 +19,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from PIL import Image, ImageFile
+from huggingface_hub import hf_hub_download
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from transformers import (
     AutoModelForImageTextToText,
@@ -208,6 +210,69 @@ class VLMultiTaskDataset(Dataset):
         item: Dict[str, Any] = {k: v[0] for k, v in enc_full.items() if isinstance(v, torch.Tensor)}
         item["labels"] = labels
         return item
+from transformers import AutoProcessor, BitsAndBytesConfig
+import json, torch
+
+def load_qwen25_vl_for_qlora(model_id: str):
+    # 1) config.json 읽기
+    cfg_path = hf_hub_download(model_id, "config.json")
+    cfg_dict = json.load(open(cfg_path))
+    # 2) Config 클래스 후보들 (auto_map 없어도 파일명 규칙으로 시도)
+    config_candidates = [
+        "configuration_qwen2_5_vl.Qwen2_5_VLConfig",
+        "configuration_qwen2_vl.Qwen2VLConfig",
+    ]
+    cfg = None
+    last_err = None
+    for target in config_candidates:
+        try:
+            ConfigClass = get_class_from_dynamic_module(target, model_id, trust_remote_code=True)
+            cfg = ConfigClass.from_dict(cfg_dict)
+            break
+        except Exception as e:
+            last_err = e
+    if cfg is None:
+        raise RuntimeError(f"[Config load failed] Tried: {config_candidates}") from last_err
+
+    # 3) Processor (remote code)
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+
+    # 4) 4-bit QLoRA bitsandbytes
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    # 5) Model 클래스 후보들 (리포마다 이름 다를 수 있음)
+    model_candidates = [
+        "modeling_qwen2_5_vl.Qwen2_5_VLForImageTextToText",
+        "modeling_qwen2_5_vl.Qwen2_5_VLForConditionalGeneration",
+        "modeling_qwen2_vl.Qwen2VLForImageTextToText",
+        "modeling_qwen2_vl.Qwen2VLForConditionalGeneration",
+    ]
+    ModelClass = None
+    last_err = None
+    for target in model_candidates:
+        try:
+            ModelClass = get_class_from_dynamic_module(target, model_id, trust_remote_code=True)
+            break
+        except Exception as e:
+            last_err = e
+    if ModelClass is None:
+        raise RuntimeError(f"[Model class not found] Tried: {model_candidates}") from last_err
+
+    # 6) 동적 모델 클래스로 직접 로드 (Auto* 우회)
+    model = ModelClass.from_pretrained(
+        model_id,
+        config=cfg,
+        trust_remote_code=True,
+        quantization_config=bnb_cfg,
+        device_map=None,   # 단일 GPU 학습 권장
+    )
+    return model, processor
+
 
 # ==========================
 # Collator (pad by processor)
@@ -248,27 +313,10 @@ class DataCollator:
 def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Processor & base model (4‑bit QLoRA)
-    processor = AutoProcessor.from_pretrained(args.base_model, trust_remote_code=True)
-
     cfg = AutoConfig.from_pretrained(
         args.base_model, trust_remote_code=True
     )
-
-    bnb_cfg = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-
-    model = AutoModelForImageTextToText.from_pretrained(
-        args.base_model,
-        config=cfg,
-        trust_remote_code=True,
-        quantization_config=bnb_cfg,
-        device_map=None,
-    )
+    model, processor = load_qwen25_vl_for_qlora(args.base_model)
 
     # Prepare for k‑bit LoRA (phase 1: LLM‑centric)
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
