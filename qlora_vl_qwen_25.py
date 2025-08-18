@@ -487,28 +487,28 @@ def train_model(
 
     # Model 4-bit
     print(f"[Load] {base_model} in 4-bit (nf4, bfloat16 compute)")
-bnb_config = make_bnb_config()
-try:
-    model = AutoModelForVision2Seq.from_pretrained(
-        base_model,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        quantization_config=bnb_config,
-        trust_remote_code=True,
-    )
-except Exception as _e1:
+    bnb_config = make_bnb_config()
     try:
-        model = AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForVision2Seq.from_pretrained(
             base_model,
             device_map="auto",
             torch_dtype=torch.bfloat16,
             quantization_config=bnb_config,
             trust_remote_code=True,
         )
-    except Exception as _e2:
-        raise RuntimeError(f"Failed to load VLM base model for {base_model}: {_e1} / {_e2}")
-model.config.use_cache = False
-model = prepare_model_for_kbit_training(model)
+    except Exception as _e1:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                quantization_config=bnb_config,
+                trust_remote_code=True,
+            )
+        except Exception as _e2:
+            raise RuntimeError(f"Failed to load VLM base model for {base_model}: {_e1} / {_e2}")
+    model.config.use_cache = False
+    model = prepare_model_for_kbit_training(model)
 
     # LoRA (language modules only)
     peft_cfg = make_lora_config(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, target_modules=target_modules)
