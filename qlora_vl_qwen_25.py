@@ -1,4 +1,4 @@
-import os, io, json, argparse, random
+import os, io, json, argparse, random, base64, re, hashlib
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 from PIL import Image
-import base64, re, hashlib
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
@@ -25,6 +24,9 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
+# ==========================
+# Config
+# ==========================
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_OUT_ROOT = "/content/drive/MyDrive/Colab Notebooks/wook/output"
 DATA_SUBDIR = "datasets/qlora"
@@ -38,10 +40,15 @@ SYSTEM_PROMPT = (
 LONG_SIDE = 1280
 MAX_SIDE_HARD = 3500
 URL_TIMEOUT = 20
-IMG_BASE = None
+IMG_BASE: Optional[str] = None  # can be set by caller
+MIN_IMG_SIDE = 64  # reject images smaller than this
+
 RESIZE_CACHE_DIR = "/tmp/img_resized_cache"
 os.makedirs(RESIZE_CACHE_DIR, exist_ok=True)
 
+# ==========================
+# Utils
+# ==========================
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -146,7 +153,9 @@ def build_train_valid(out_root: str,
     save_both_parquet_jsonl(valid_df, os.path.join(out_dir, "valid"))
     return train_df, valid_df
 
-
+# ==========================
+# Image I/O (strict)
+# ==========================
 _b64_re = re.compile(r'^[A-Za-z0-9+/=\n\r]+$')
 
 def looks_like_base64(s: str, min_len: int = 128) -> bool:
@@ -154,16 +163,9 @@ def looks_like_base64(s: str, min_len: int = 128) -> bool:
         return False
     try:
         head = base64.b64decode(s[:4096], validate=True)
-        if head.startswith(b"\x89PNG") or head.startswith(b"\xff\xd8"):
-            return True
-    except Exception:
-        pass
-    try:
-        head = base64.b64decode(s[:4096])
         return head.startswith(b"\x89PNG") or head.startswith(b"\xff\xd8")
     except Exception:
         return False
-
 
 def is_url(path: str) -> bool:
     try:
@@ -208,71 +210,87 @@ def finalize_image(img: Image.Image) -> Image.Image:
     return out
 
 
-def load_image_any(input_obj) -> Image.Image:
+def load_image_strict(input_obj) -> Image.Image:
+    """Load an image, raise on failure. No 1×1 fallbacks."""
     try:
         if isinstance(input_obj, (bytes, bytearray)):
-            return finalize_image(Image.open(io.BytesIO(input_obj)).convert("RGB"))
-        if isinstance(input_obj, str):
+            img = Image.open(io.BytesIO(input_obj)).convert("RGB")
+            img = finalize_image(img)
+        elif isinstance(input_obj, str):
             s = input_obj.strip()
             if s.startswith("data:image"):
                 b64 = s.split(",", 1)[1]
-                return finalize_image(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
-            if looks_like_base64(s):
-                return finalize_image(Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB"))
-            if is_url(s):
+                img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+                img = finalize_image(img)
+            elif looks_like_base64(s):
+                img = Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
+                img = finalize_image(img)
+            elif is_url(s):
                 req = Request(s, headers={"User-Agent": "Mozilla/5.0"})
                 with urlopen(req, timeout=URL_TIMEOUT) as r:
                     raw = r.read()
-                return finalize_image(Image.open(io.BytesIO(raw)).convert("RGB"))
-            p = s
-            if not os.path.isabs(p) and IMG_BASE:
-                p = os.path.join(IMG_BASE, p)
-            return finalize_image(Image.open(p).convert("RGB"))
-    except Exception:
-        return Image.new("RGB", (1, 1), (0, 0, 0))
-    return Image.new("RGB", (1, 1), (0, 0, 0))
-
-
-def build_messages(inp_type: str, task: str, inp: str, question: str, output: Optional[str] = None,
-                   add_task_hint: bool = False) -> List[Dict[str, Any]]:
-    system = {"role": "system", "content": SYSTEM_PROMPT}
-    hint = f"[TASK={task}]\n" if add_task_hint else ""
-    user_text_parts = ["Please produce the required output for the given input."]
-    if question and str(question).strip():
-        user_text_parts.append(f"Question:\n{str(question).strip()}")
-    if inp_type == "text":
-        user_text_parts.append(f"Input:\n{inp}")
-        user = {"role": "user", "content": f"{hint}" + "\n".join(user_text_parts)}
-    else:
-        user = {"role": "user", "content": [
-            {"type": "image", "image": inp},
-            {"type": "text",  "text": f"{hint}" + "\n".join(user_text_parts)},
-        ]}
-    msgs = [system, user]
-    if output is not None:
-        msgs.append({"role": "assistant", "content": str(output).rstrip()})
-    return msgs
-
-
-def extract_and_load_images(messages: List[Dict[str, Any]]) -> Tuple[List[Image.Image], List[Dict[str, Any]]]:
-    images: List[Image.Image] = []
-    msgs = []
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            new_list = []
-            for c in msg["content"]:
-                if isinstance(c, dict) and c.get("type") == "image":
-                    img_src = c.get("image")
-                    pil = img_src if isinstance(img_src, Image.Image) else load_image_any(img_src)
-                    images.append(pil)
-                    new_list.append({"type": "image", "image": pil})
-                else:
-                    new_list.append(c)
-            msgs.append({"role": msg["role"], "content": new_list})
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                img = finalize_image(img)
+            else:
+                p = s
+                if not os.path.isabs(p) and IMG_BASE:
+                    p = os.path.join(IMG_BASE, p)
+                img = Image.open(p).convert("RGB")
+                img = finalize_image(img)
         else:
-            msgs.append(msg)
-    return images, msgs
+            raise TypeError(f"Unsupported image input type: {type(input_obj)}")
+    except Exception as e:
+        raise RuntimeError(f"[ImageLoadError] {input_obj!r} -> {e}")
 
+    w, h = img.size
+    if min(w, h) < MIN_IMG_SIDE:
+        raise ValueError(f"[ImageTooSmall] {w}x{h} < {MIN_IMG_SIDE}")
+    return img
+
+# ==========================
+# Prompt building (aligned with inference style)
+# ==========================
+
+def build_user_prompt(task: str, input_type: str, the_input: str, question: str | None) -> str:
+    t = (task or "").strip().lower()
+    it = (input_type or "text").strip().lower()
+    q = (question or "").strip()
+    lines = [
+        f"Task: {t}",
+        f"InputType: {it}",
+        f"Question: {q}" if q else "Question:",
+    ]
+    lines.append("Input:\n" + (the_input or "") if it == "text" else "Input: <image>")
+    return "\n".join(lines)
+
+
+def build_messages_placeholder(inp_type: str, task: str, inp: str, question: str, output: Optional[str] = None,
+                               add_task_hint: bool = False) -> Tuple[List[Dict[str, Any]], Optional[List[Image.Image]]]:
+    # Build messages with <image> placeholder; pass PIL images separately
+    hint = f"[TASK={task}]\n" if add_task_hint else ""
+    user_prompt = build_user_prompt(task, inp_type, str(inp), question)
+
+    if inp_type == "image":
+        # Load image strictly and keep only placeholder in content
+        img = load_image_strict(inp)
+        img = finalize_image(img)
+        user_content = [{"type": "image"}, {"type": "text", "text": hint + user_prompt}]
+        images = [img]
+    else:
+        user_content = [{"type": "text", "text": hint + user_prompt}]
+        images = None
+
+    msgs = [
+        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        {"role": "user",   "content": user_content},
+    ]
+    if output is not None:
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": str(output).rstrip()}]})
+    return msgs, images
+
+# ==========================
+# Dataset & Collator
+# ==========================
 
 class MMDataset(Dataset):
     def __init__(self, df: pd.DataFrame, processor: AutoProcessor, add_task_hint: bool = False):
@@ -292,13 +310,12 @@ class MMDataset(Dataset):
         q        = row.get("question") or ""
         out      = str(row.get("output")).rstrip()
 
-        msgs_prompt_only = build_messages(inp_type, task, inp, q, output=None, add_task_hint=self.add_task_hint)
-        msgs_with_answer = build_messages(inp_type, task, inp, q, output=out, add_task_hint=self.add_task_hint)
-
-        images_p, msgs_prompt_only = extract_and_load_images(msgs_prompt_only)
-        images_f, msgs_with_answer = extract_and_load_images(msgs_with_answer)
-
-        images = images_f if len(images_f) > 0 else None
+        msgs_prompt_only, images = build_messages_placeholder(
+            inp_type, task, inp, q, output=None, add_task_hint=self.add_task_hint
+        )
+        msgs_with_answer, _ = build_messages_placeholder(
+            inp_type, task, inp, q, output=out, add_task_hint=self.add_task_hint
+        )
 
         prompt_text = self.processor.apply_chat_template(
             msgs_prompt_only, tokenize=False, add_generation_prompt=False
@@ -307,6 +324,7 @@ class MMDataset(Dataset):
             msgs_with_answer, tokenize=False, add_generation_prompt=False
         )
 
+        # Encode with same images for prompt/full
         enc_full = self.processor(
             text=full_text,
             images=images,
@@ -329,25 +347,14 @@ class MMDataset(Dataset):
         labels = input_ids.clone()
 
         prompt_len = enc_prompt["input_ids"].shape[-1]
-
-        # ★★★ ROBUST LABEL MASKING ★★★
-        # Safeguard: ensure prompt_len is not longer than the labels tensor itself.
-        # This prevents an index out of bounds error if truncation makes the full sequence
-        # shorter than the prompt-only sequence.
-        mask_len = min(prompt_len, labels.shape[0])
-        labels[:mask_len] = -100
-
-        # Edge case: if truncation removed the entire answer, the whole labels tensor
-        # could be -100, which can cause issues for some trainers.
-        # To prevent this, we make the last token learnable.
-        if (labels == -100).all():
-            labels[-1] = input_ids[-1]
+        labels[:prompt_len] = -100
 
         item = {
             "input_ids": input_ids,
             "attention_mask": attn_mask,
             "labels": labels,
         }
+        # include vision features (e.g., pixel_values, image_grid_thw) if present
         for k in enc_full:
             if k not in item and isinstance(enc_full[k], torch.Tensor):
                 item[k] = enc_full[k][0]
@@ -391,13 +398,16 @@ class VLDataCollator:
                 batch[k] = vals
         return batch
 
+# ==========================
+# QLoRA Config
+# ==========================
 
 def make_bnb_config() -> BitsAndBytesConfig:
     return BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.bfloat16,  # A100 supports bf16
     )
 
 
@@ -458,6 +468,9 @@ def resolve_profile(profile: str) -> dict:
         eval_steps=500,
     )
 
+# ==========================
+# Train
+# ==========================
 
 def train_model(
     base_model: str,
@@ -517,6 +530,11 @@ def train_model(
         missing = required - set(valid_df.columns)
         raise ValueError(f"Valid file missing columns: {missing}")
 
+    # quick audit for image rows (fail fast)
+    if (train_df["input_type"].str.lower() == "image").any():
+        for i, r in train_df[(train_df["input_type"].str.lower()=="image")].head(8).iterrows():  # sample a few
+            _ = load_image_strict(r["input"])  # will raise on bad/too small
+
     train_ds = MMDataset(train_df, processor, add_task_hint=add_task_hint)
     eval_ds = MMDataset(valid_df, processor, add_task_hint=False) if valid_df is not None else None
     collator = VLDataCollator(pad_token_id=tokenizer.pad_token_id)
@@ -535,9 +553,11 @@ def train_model(
         logging_steps=p["logging_steps"],
         save_steps=p["save_steps"],
         save_total_limit=2,
-        bf16=True,
+        bf16=True,  # A100
         gradient_checkpointing=True,
         report_to="none",
+        remove_unused_columns=False,  # keep vision fields
+        optim="paged_adamw_8bit",
     )
 
     sig = inspect.signature(TrainingArguments.__init__)
@@ -552,7 +572,6 @@ def train_model(
     maybe("load_best_model_at_end", bool(eval_ds))
     maybe("metric_for_best_model", "eval_loss" if eval_ds is not None else None)
     maybe("greater_is_better", False if eval_ds is not None else None)
-    maybe("optim", "paged_adamw_8bit")
 
     training_args = TrainingArguments(**ta_kwargs)
 
@@ -577,6 +596,9 @@ def train_model(
     tokenizer.save_pretrained(run_dir)
     return run_dir
 
+# ==========================
+# Quick infer (optional, to validate the adapter after training)
+# ==========================
 
 def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: Optional[str] = None, question: Optional[str] = None):
     from peft import PeftModel
@@ -590,17 +612,18 @@ def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: O
     processor = AutoProcessor.from_pretrained(run_dir, trust_remote_code=True)
     tok = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
 
-    msgs = [{"role":"system","content":SYSTEM_PROMPT}]
+    msgs = [{"role":"system","content":[{"type":"text","text":SYSTEM_PROMPT}]}]
     images = None
     if image_url:
         req = Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=URL_TIMEOUT) as r:
             raw = r.read()
         img = Image.open(io.BytesIO(raw)).convert("RGB")
-        msgs.append({"role":"user","content":[{"type":"image","image":img},{"type":"text","text":question or "What is in the image?"}]})
+        img = finalize_image(img)
+        msgs.append({"role":"user","content":[{"type":"image"},{"type":"text","text":question or "What is in the image?"}]})
         images = [img]
     else:
-        msgs.append({"role":"user","content":question or "Please provide a short answer."})
+        msgs.append({"role":"user","content":[{"type":"text","text":question or "Please provide a short answer."}]})
 
     prompt = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=prompt, images=images, return_tensors="pt").to(model.device)
@@ -614,6 +637,9 @@ def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: O
         text = processor.decode(ids, skip_special_tokens=True)
     return text
 
+# ==========================
+# CLI
+# ==========================
 
 def main():
     parser = argparse.ArgumentParser()
