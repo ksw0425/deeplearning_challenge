@@ -338,7 +338,7 @@ def train(args):
         weight_decay=0.0,
         lr_scheduler_type="cosine",
         save_total_limit=2,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         save_strategy="steps",
         logging_dir=os.path.join(args.out_dir, "logs"),
         report_to=["none"],
