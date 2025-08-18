@@ -325,22 +325,27 @@ class MMDataset(Dataset):
         )
 
         # Encode with same images for prompt/full
-        enc_full = self.processor(
-            text=full_text,
-            images=images,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_length,
-        )
-        enc_prompt = self.processor(
-            text=prompt_text,
-            images=images,
-            return_tensors="pt",
-            padding="longest",
-            truncation=True,
-            max_length=self.max_length,
-        )
+        if images is not None:
+            enc_full = self.processor(
+                text=full_text, images=images,
+                return_tensors="pt", padding="longest",
+                # ✦ truncation 금지: max_length도 주지 않음
+            )
+            enc_prompt = self.processor(
+                text=prompt_text, images=images,
+                return_tensors="pt", padding="longest",
+            )
+        else:
+            enc_full = self.processor(
+                text=full_text,
+                return_tensors="pt", padding="longest",
+                truncation=True, max_length=self.max_length,  # 텍스트만 안전
+            )
+            enc_prompt = self.processor(
+                text=prompt_text,
+                return_tensors="pt", padding="longest",
+                truncation=True, max_length=self.max_length,
+            )
 
         input_ids = enc_full["input_ids"][0]
         attn_mask = enc_full["attention_mask"][0]
