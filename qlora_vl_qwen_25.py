@@ -350,10 +350,9 @@ class MMDataset(Dataset):
         input_ids = enc_full["input_ids"][0]
         attn_mask = enc_full["attention_mask"][0]
         labels = input_ids.clone()
-
         prompt_len = enc_prompt["input_ids"].shape[-1]
         labels[:prompt_len] = -100
-
+        
         item = {
             "input_ids": input_ids,
             "attention_mask": attn_mask,
@@ -362,48 +361,27 @@ class MMDataset(Dataset):
         for k, v in enc_full.items():
             if k in item:
                 continue
-            if isinstance(v, torch.Tensor):
-                item[k] = v[0]
-            else:
-                item[k] = v
+            # ★ 텍스트 3형제 외에는 절대 [0] 하지 말 것!
+            item[k] = v
         return item
 
 
 @dataclass
-class VLDataCollator:
+class QwenVLDataCollator:
+    processor  # AutoProcessor
     pad_token_id: int
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        batch: Dict[str, Any] = {}
-        text_keys = ["input_ids", "attention_mask", "labels"]
-        for k in text_keys:
-            if k not in features[0]:
-                continue
-            max_len = max(f[k].shape[-1] for f in features)
-            tensors = []
-            for f in features:
-                t = f[k]
-                pad_len = max_len - t.shape[-1]
-                if pad_len > 0:
-                    pad_val = self.pad_token_id if k != "labels" else -100
-                    t = F.pad(t, (0, pad_len), value=pad_val)
-                tensors.append(t)
-            batch[k] = torch.stack(tensors, dim=0)
 
-        all_keys = set().union(*(f.keys() for f in features)) - set(text_keys)
-        for k in sorted(all_keys):
-            vals = [f.get(k, None) for f in features]
-            if any(isinstance(v, torch.Tensor) for v in vals):
-                ref = next((v for v in vals if isinstance(v, torch.Tensor)), None)
-                if ref is None:
-                    batch[k] = vals
-                    continue
-                filled = [v if isinstance(v, torch.Tensor) else torch.zeros_like(ref) for v in vals]
-                try:
-                    batch[k] = torch.stack(filled, dim=0)
-                except Exception:
-                    batch[k] = filled
-            else:
-                batch[k] = vals
+    def __call__(self, features):
+        # 1) 텍스트 라벨은 이미 각 item에 있으므로 pad에서 함께 패딩
+        #    (pad 후 라벨의 pad 토큰을 -100으로 바꾸는 보정만 해주면 더 안전)
+        batch = self.processor.pad(features, return_tensors="pt")
+
+        # 2) labels 패딩(-100) 보정
+        if "labels" in batch:
+            labels = batch["labels"]
+            labels = labels.masked_fill(labels == self.pad_token_id, -100)
+            batch["labels"] = labels
+
         return batch
 
 # ==========================
