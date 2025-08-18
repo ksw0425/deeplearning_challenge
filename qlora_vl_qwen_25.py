@@ -359,10 +359,13 @@ class MMDataset(Dataset):
             "attention_mask": attn_mask,
             "labels": labels,
         }
-        # include vision features (e.g., pixel_values, image_grid_thw) if present
-        for k in enc_full:
-            if k not in item and isinstance(enc_full[k], torch.Tensor):
-                item[k] = enc_full[k][0]
+        for k, v in enc_full.items():
+            if k in item:
+                continue
+            if isinstance(v, torch.Tensor):
+                item[k] = v[0]
+            else:
+                item[k] = v
         return item
 
 
