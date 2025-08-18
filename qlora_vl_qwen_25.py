@@ -279,7 +279,6 @@ class MMDataset(Dataset):
         self.df = df.reset_index(drop=True)
         self.processor = processor
         self.add_task_hint = add_task_hint
-        # ★ FIX: Get max length from tokenizer to use for truncation
         self.max_length = getattr(self.processor.tokenizer, 'model_max_length', 4096)
 
     def __len__(self):
@@ -308,7 +307,6 @@ class MMDataset(Dataset):
             msgs_with_answer, tokenize=False, add_generation_prompt=False
         )
 
-        # ★ FIX: Add truncation to prevent sequences longer than the model can handle
         enc_full = self.processor(
             text=full_text,
             images=images,
@@ -331,7 +329,19 @@ class MMDataset(Dataset):
         labels = input_ids.clone()
 
         prompt_len = enc_prompt["input_ids"].shape[-1]
-        labels[:prompt_len] = -100
+
+        # ★★★ ROBUST LABEL MASKING ★★★
+        # Safeguard: ensure prompt_len is not longer than the labels tensor itself.
+        # This prevents an index out of bounds error if truncation makes the full sequence
+        # shorter than the prompt-only sequence.
+        mask_len = min(prompt_len, labels.shape[0])
+        labels[:mask_len] = -100
+
+        # Edge case: if truncation removed the entire answer, the whole labels tensor
+        # could be -100, which can cause issues for some trainers.
+        # To prevent this, we make the last token learnable.
+        if (labels == -100).all():
+            labels[-1] = input_ids[-1]
 
         item = {
             "input_ids": input_ids,
