@@ -535,7 +535,9 @@ def train_model(
     p = resolve_profile(profile)
     print(f"[Profile] {profile} => {p}")
 
-    training_args = TrainingArguments(
+    # Build TrainingArguments with backward/forward compatibility
+    import inspect
+    ta_kwargs = dict(
         output_dir=run_dir,
         per_device_train_batch_size=p["per_device_train_batch_size"],
         per_device_eval_batch_size=p["per_device_eval_batch_size"],
@@ -546,17 +548,30 @@ def train_model(
         weight_decay=p["weight_decay"],
         logging_steps=p["logging_steps"],
         save_steps=p["save_steps"],
-        evaluation_strategy=("steps" if eval_ds is not None else "no"),
-        eval_steps=(p["eval_steps"] if eval_ds is not None else None),
         save_total_limit=2,
         bf16=True,
         gradient_checkpointing=True,
-        optim="paged_adamw_8bit",
         report_to="none",
-        load_best_model_at_end=True if eval_ds is not None else False,
-        metric_for_best_model="eval_loss" if eval_ds is not None else None,
-        greater_is_better=False if eval_ds is not None else None,
     )
+
+    sig = inspect.signature(TrainingArguments.__init__)
+    def maybe(key, value):
+        if key in sig.parameters and value is not None:
+            ta_kwargs[key] = value
+
+    # evaluation-related
+    eval_strategy = "steps" if eval_ds is not None else "no"
+    maybe("evaluation_strategy", eval_strategy)
+    maybe("eval_strategy", eval_strategy)  # some versions use this alias
+    maybe("eval_steps", p.get("eval_steps") if eval_ds is not None else None)
+    maybe("load_best_model_at_end", bool(eval_ds))
+    maybe("metric_for_best_model", "eval_loss" if eval_ds is not None else None)
+    maybe("greater_is_better", False if eval_ds is not None else None)
+
+    # optimizer (fallback if not supported)
+    maybe("optim", "paged_adamw_8bit")
+
+    training_args = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
         model=model,
