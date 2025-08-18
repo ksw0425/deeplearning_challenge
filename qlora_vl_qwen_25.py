@@ -279,8 +279,12 @@ class MMDataset(Dataset):
         self.df = df.reset_index(drop=True)
         self.processor = processor
         self.add_task_hint = add_task_hint
+        # ★ FIX: Get max length from tokenizer to use for truncation
+        self.max_length = getattr(self.processor.tokenizer, 'model_max_length', 4096)
+
     def __len__(self):
         return len(self.df)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.df.iloc[idx].to_dict()
         inp_type = str(row.get("input_type")).strip().lower()
@@ -288,34 +292,47 @@ class MMDataset(Dataset):
         inp      = row.get("input")
         q        = row.get("question") or ""
         out      = str(row.get("output")).rstrip()
+
         msgs_prompt_only = build_messages(inp_type, task, inp, q, output=None, add_task_hint=self.add_task_hint)
         msgs_with_answer = build_messages(inp_type, task, inp, q, output=out, add_task_hint=self.add_task_hint)
+
         images_p, msgs_prompt_only = extract_and_load_images(msgs_prompt_only)
         images_f, msgs_with_answer = extract_and_load_images(msgs_with_answer)
+
         images = images_f if len(images_f) > 0 else None
+
         prompt_text = self.processor.apply_chat_template(
             msgs_prompt_only, tokenize=False, add_generation_prompt=False
         )
         full_text = self.processor.apply_chat_template(
             msgs_with_answer, tokenize=False, add_generation_prompt=False
         )
+
+        # ★ FIX: Add truncation to prevent sequences longer than the model can handle
         enc_full = self.processor(
             text=full_text,
             images=images,
             return_tensors="pt",
             padding="longest",
+            truncation=True,
+            max_length=self.max_length,
         )
         enc_prompt = self.processor(
             text=prompt_text,
             images=images,
             return_tensors="pt",
             padding="longest",
+            truncation=True,
+            max_length=self.max_length,
         )
+
         input_ids = enc_full["input_ids"][0]
         attn_mask = enc_full["attention_mask"][0]
         labels = input_ids.clone()
+
         prompt_len = enc_prompt["input_ids"].shape[-1]
         labels[:prompt_len] = -100
+
         item = {
             "input_ids": input_ids,
             "attention_mask": attn_mask,
@@ -346,6 +363,7 @@ class VLDataCollator:
                     t = F.pad(t, (0, pad_len), value=pad_val)
                 tensors.append(t)
             batch[k] = torch.stack(tensors, dim=0)
+
         all_keys = set().union(*(f.keys() for f in features)) - set(text_keys)
         for k in sorted(all_keys):
             vals = [f.get(k, None) for f in features]
@@ -446,10 +464,12 @@ def train_model(
     set_seed(42)
     run_dir = os.path.join(out_root, f"qlora-vl-qwen25-7b")
     os.makedirs(run_dir, exist_ok=True)
+
     processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=True)
     tokenizer = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
     bnb_config = make_bnb_config()
     try:
         model = AutoModelForVision2Seq.from_pretrained(
@@ -470,12 +490,15 @@ def train_model(
             )
         except Exception as _e2:
             raise RuntimeError(f"Failed to load VLM base model for {base_model}: {_e1} / {_e2}")
+
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model)
     peft_cfg = make_lora_config(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, target_modules=target_modules)
     model = get_peft_model(model, peft_cfg)
+
     train_df = read_any(train_file)
     valid_df = read_any(valid_file) if valid_file else None
+
     required = {"task","input_type","input","question","output"}
     if not required.issubset(set(train_df.columns)):
         missing = required - set(train_df.columns)
@@ -483,9 +506,11 @@ def train_model(
     if valid_df is not None and not required.issubset(set(valid_df.columns)):
         missing = required - set(valid_df.columns)
         raise ValueError(f"Valid file missing columns: {missing}")
+
     train_ds = MMDataset(train_df, processor, add_task_hint=add_task_hint)
     eval_ds = MMDataset(valid_df, processor, add_task_hint=False) if valid_df is not None else None
     collator = VLDataCollator(pad_token_id=tokenizer.pad_token_id)
+
     p = resolve_profile(profile)
     import inspect
     ta_kwargs = dict(
@@ -504,10 +529,12 @@ def train_model(
         gradient_checkpointing=True,
         report_to="none",
     )
+
     sig = inspect.signature(TrainingArguments.__init__)
     def maybe(key, value):
         if key in sig.parameters and value is not None:
             ta_kwargs[key] = value
+
     eval_strategy = "steps" if eval_ds is not None else "no"
     maybe("evaluation_strategy", eval_strategy)
     maybe("eval_strategy", eval_strategy)
@@ -516,7 +543,9 @@ def train_model(
     maybe("metric_for_best_model", "eval_loss" if eval_ds is not None else None)
     maybe("greater_is_better", False if eval_ds is not None else None)
     maybe("optim", "paged_adamw_8bit")
+
     training_args = TrainingArguments(**ta_kwargs)
+
     init_kwargs = dict(
         model=model,
         args=training_args,
@@ -524,12 +553,15 @@ def train_model(
         eval_dataset=eval_ds,
         data_collator=collator,
     )
+
     if "processing_class" in inspect.signature(Trainer.__init__).parameters:
         init_kwargs["processing_class"] = processor
     else:
         init_kwargs["tokenizer"] = tokenizer
+
     trainer = Trainer(**init_kwargs)
     trainer.train()
+
     trainer.model.save_pretrained(run_dir)
     processor.save_pretrained(run_dir)
     tokenizer.save_pretrained(run_dir)
@@ -542,10 +574,12 @@ def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: O
         model = AutoModelForVision2Seq.from_pretrained(base_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
     except Exception:
         model = AutoModelForCausalLM.from_pretrained(base_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
+
     model = PeftModel.from_pretrained(model, run_dir)
     model.eval()
     processor = AutoProcessor.from_pretrained(run_dir, trust_remote_code=True)
     tok = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
+
     msgs = [{"role":"system","content":SYSTEM_PROMPT}]
     images = None
     if image_url:
@@ -557,8 +591,10 @@ def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: O
         images = [img]
     else:
         msgs.append({"role":"user","content":question or "Please provide a short answer."})
+
     prompt = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     inputs = processor(text=prompt, images=images, return_tensors="pt").to(model.device)
+
     with torch.no_grad():
         out = model.generate(**inputs, max_new_tokens=128, do_sample=False)
     ids = out[0]
@@ -572,11 +608,13 @@ def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: O
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
+
     p_build = sub.add_parser("build")
     p_build.add_argument("--out_root", type=str, default=DEFAULT_OUT_ROOT)
     p_build.add_argument("--inputs_file", type=str, required=True)
     p_build.add_argument("--labels_file", type=str, default=None)
     p_build.add_argument("--valid_ratio", type=float, default=0.1)
+
     p_train = sub.add_parser("train")
     p_train.add_argument("--base_model", type=str, default=DEFAULT_BASE_MODEL)
     p_train.add_argument("--train_file", type=str, required=True)
@@ -587,7 +625,9 @@ def main():
     p_train.add_argument("--lora_r", type=int, default=64)
     p_train.add_argument("--lora_alpha", type=int, default=128)
     p_train.add_argument("--lora_dropout", type=float, default=0.05)
+
     args = parser.parse_args()
+
     if args.cmd == "build":
         build_train_valid(
             out_root=args.out_root,
@@ -596,6 +636,7 @@ def main():
             valid_ratio=args.valid_ratio,
         )
         return
+
     if args.cmd == "train":
         train_model(
             base_model=args.base_model,
