@@ -496,7 +496,13 @@ def train_model(
     run_dir = os.path.join(out_root, f"qlora-vl-qwen25-7b")
     os.makedirs(run_dir, exist_ok=True)
 
-    processor = AutoProcessor.from_pretrained(base_model, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+    base_model,
+    trust_remote_code=True,
+    min_pixels=256 * 28 * 28,   # 약 200k 픽셀 (하한선)
+    max_pixels=1024 * 28 * 28   # 약 800k 픽셀 (상한선)
+    )
+
     tokenizer = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
