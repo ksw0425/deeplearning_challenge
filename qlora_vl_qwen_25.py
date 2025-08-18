@@ -359,34 +359,56 @@ class VLDataCollator:
     pad_token_id: int
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
-        keys = features[0].keys()
+        """Robustly collate mixed vision/text samples.
+        - Pads input_ids/attention_mask/labels to the longest.
+        - For optional vision keys (e.g., pixel_values, image_sizes, pixel_attention_mask, etc.),
+          creates zeros-like placeholders for samples that don't have them so a mixed batch can stack.
+        - If stacking still fails due to shape mismatch, falls back to a Python list for that key.
+        """
         batch: Dict[str, Any] = {}
-        # pad text-like
-        for k in ["input_ids", "attention_mask", "labels"]:
-            if k in keys:
-                max_len = max(f[k].shape[-1] for f in features)
-                tensors = []
-                for f in features:
-                    t = f[k]
-                    pad_len = max_len - t.shape[-1]
-                    if pad_len > 0:
-                        pad_val = self.pad_token_id if k != "labels" else -100
-                        t = F.pad(t, (0, pad_len), value=pad_val)
-                    tensors.append(t)
-                batch[k] = torch.stack(tensors, dim=0)
-        # stack vision tensors if present
-        for k in keys:
-            if k in ("input_ids", "attention_mask", "labels"):
+
+        # ---- 1) Text tensors (always present) ----
+        text_keys = ["input_ids", "attention_mask", "labels"]
+        for k in text_keys:
+            if k not in features[0]:
+                # If missing (shouldn't happen), skip
                 continue
-            v0 = features[0][k]
-            if isinstance(v0, torch.Tensor):
+            max_len = max(f[k].shape[-1] for f in features)
+            tensors = []
+            for f in features:
+                t = f[k]
+                pad_len = max_len - t.shape[-1]
+                if pad_len > 0:
+                    pad_val = self.pad_token_id if k != "labels" else -100
+                    t = F.pad(t, (0, pad_len), value=pad_val)
+                tensors.append(t)
+            batch[k] = torch.stack(tensors, dim=0)
+
+        # ---- 2) Optional keys (union across features) ----
+        # Collect union of keys minus text keys
+        all_keys = set().union(*(f.keys() for f in features)) - set(text_keys)
+        for k in sorted(all_keys):
+            # Gather values (may include missing)
+            vals = [f.get(k, None) for f in features]
+
+            # Case A: tensors (some may be None)
+            if any(isinstance(v, torch.Tensor) for v in vals):
+                # choose a reference tensor shape/dtype
+                ref = next((v for v in vals if isinstance(v, torch.Tensor)), None)
+                if ref is None:
+                    batch[k] = vals  # nothing to stack
+                    continue
+                # replace None with zeros-like
+                filled = [v if isinstance(v, torch.Tensor) else torch.zeros_like(ref) for v in vals]
                 try:
-                    batch[k] = torch.stack([f[k] for f in features], dim=0)
+                    batch[k] = torch.stack(filled, dim=0)
                 except Exception:
-                    # Fallback: keep as list if shapes differ (rare)
-                    batch[k] = [f[k] for f in features]
+                    # last resort: keep as list (model should ignore unused vision keys)
+                    batch[k] = filled
             else:
-                batch[k] = [f[k] for f in features]
+                # Non-tensor payloads (e.g., strings/lists); keep aligned list
+                batch[k] = vals
+
         return batch
 
 
@@ -535,6 +557,7 @@ def train_model(
     p = resolve_profile(profile)
     print(f"[Profile] {profile} => {p}")
 
+    # Build TrainingArguments with backward/forward compatibility
     import inspect
     ta_kwargs = dict(
         output_dir=run_dir,
@@ -552,24 +575,24 @@ def train_model(
         gradient_checkpointing=True,
         report_to="none",
     )
-    
+
     sig = inspect.signature(TrainingArguments.__init__)
     def maybe(key, value):
         if key in sig.parameters and value is not None:
             ta_kwargs[key] = value
-    
-    # evaluation-related (only if supported by your transformers)
+
+    # evaluation-related
     eval_strategy = "steps" if eval_ds is not None else "no"
-    maybe("evaluation_strategy", eval_strategy)   # new API
-    maybe("eval_strategy", eval_strategy)         # some older builds use this name
+    maybe("evaluation_strategy", eval_strategy)
+    maybe("eval_strategy", eval_strategy)  # some versions use this alias
     maybe("eval_steps", p.get("eval_steps") if eval_ds is not None else None)
     maybe("load_best_model_at_end", bool(eval_ds))
     maybe("metric_for_best_model", "eval_loss" if eval_ds is not None else None)
     maybe("greater_is_better", False if eval_ds is not None else None)
-    
-    # optimizer (only if supported; otherwise fallback to default AdamW)
+
+    # optimizer (fallback if not supported)
     maybe("optim", "paged_adamw_8bit")
-    
+
     training_args = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
