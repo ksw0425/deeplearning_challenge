@@ -42,6 +42,7 @@ import pandas as pd
 import numpy as np
 from PIL import Image
 import requests
+import base64
 
 from sklearn.model_selection import StratifiedShuffleSplit
 
@@ -96,27 +97,31 @@ def read_any(path: str) -> pd.DataFrame:
 def to_unified_schema(df: pd.DataFrame, col_map: Optional[dict] = None) -> pd.DataFrame:
     """
     Standardize to columns: [id, task, input_type, input, question, output]
-    input_type ∈ {"image", "text"}; input is image path/URL or text.
+    input_type ∈ {"image", "text"}; input is image path/URL, raw bytes/base64, or text.
+    If `id` is missing, auto-generate stable ids.
     """
     df = df.copy()
     if col_map:
         df = df.rename(columns=col_map)
-    # ensure columns
-    for c in ["id","task","input_type","input"]:
+    # required base columns (id optional)
+    required_base = ["task","input_type","input"]
+    for c in required_base:
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
+    if "id" not in df.columns:
+        df["id"] = [f"{df.loc[i, 'task']}_{i}" for i in range(len(df))]
     if "question" not in df.columns:
         df["question"] = ""
     if "output" not in df.columns:
         df["output"] = ""
 
-    # types
-    for c in ["id","task","input_type","input","question","output"]:
+    # types (keep raw input for images if bytes)
+    for c in ["id","task","input_type","question","output"]:
         df[c] = df[c].astype(str)
 
     # normalize input_type
     def _norm_it(x: str) -> str:
-        x = x.lower().strip()
+        x = str(x).lower().strip()
         if "img" in x or x == "image":
             return "image"
         return "text" if "text" in x or x == "text" else x
@@ -199,11 +204,37 @@ def build_train_valid(out_root: str,
 # Prompt builder (single path)
 # =============================
 
-def load_image_any(src: str) -> Image.Image:
-    if src.startswith("http://") or src.startswith("https://"):
-        r = requests.get(src, timeout=20)
-        r.raise_for_status()
-        return Image.open(io.BytesIO(r.content)).convert("RGB")
+def load_image_any(src) -> Image.Image:
+    """Load PIL.Image from local path, URL, bytes, base64 data URI, numpy array, or PIL.Image."""
+    # bytes / bytearray
+    if isinstance(src, (bytes, bytearray)):
+        return Image.open(io.BytesIO(src)).convert("RGB")
+    # base64 data URI string
+    if isinstance(src, str) and src.startswith("data:image/"):
+        try:
+            header, b64 = src.split(",", 1)
+            return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        except Exception:
+            pass
+    # http(s) URL
+    if isinstance(src, str) and (src.startswith("http://") or src.startswith("https://")):
+        resp = requests.get(src, timeout=20)
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    # numpy array
+    try:
+        import numpy as _np
+        if isinstance(src, _np.ndarray):
+            if src.dtype != _np.uint8:
+                src = src.astype(_np.uint8)
+            if src.ndim == 2:
+                return Image.fromarray(src, "L").convert("RGB")
+            return Image.fromarray(src)
+    except Exception:
+        pass
+    # local path or already PIL
+    if isinstance(src, Image.Image):
+        return src.convert("RGB")
     return Image.open(src).convert("RGB")
 
 
@@ -512,6 +543,9 @@ def train_model(
         gradient_checkpointing=True,
         optim="paged_adamw_8bit",
         report_to="none",
+        load_best_model_at_end=True if eval_ds is not None else False,
+        metric_for_best_model="eval_loss" if eval_ds is not None else None,
+        greater_is_better=False if eval_ds is not None else None,
     )
 
     trainer = Trainer(
