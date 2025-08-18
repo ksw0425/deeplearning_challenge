@@ -41,6 +41,9 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 from PIL import Image
+import re, base64, hashlib
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 import requests
 import base64
 
@@ -62,6 +65,67 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_OUT_ROOT = "/content/drive/MyDrive/Colab Notebooks/wook/output"
 DATA_SUBDIR = "datasets/qlora"
+
+# === Image policy (same as your inference helpers) ===
+LONG_SIDE = int(os.environ.get("LONG_SIDE", 1280))            # target long side
+MAX_SIDE_HARD = int(os.environ.get("MAX_SIDE_HARD", 3500))    # absolute cap
+URL_TIMEOUT = int(os.environ.get("URL_TIMEOUT", 20))           # seconds
+IMG_BASE = os.environ.get("IMG_BASE", "") or None             # relative image base
+
+RESIZE_CACHE_DIR = "/tmp/img_resized_cache"
+os.makedirs(RESIZE_CACHE_DIR, exist_ok=True)
+
+_B64_RE = re.compile(r'^[A-Za-z0-9+/=
+
+]+$')
+
+def looks_like_base64(s: str, min_len: int = 128) -> bool:
+    if not (isinstance(s, str) and len(s) >= min_len and _B64_RE.match(s)):
+        return False
+    try:
+        head = base64.b64decode(s[:4096], validate=True)
+        return head.startswith(b"PNG") or head.startswith(b"ÿØ")
+    except Exception:
+        return False
+
+def is_url(path: str) -> bool:
+    try:
+        return urlparse(str(path)).scheme in ("http", "https")
+    except Exception:
+        return False
+
+def _cap_max_side(img: Image.Image, cap=MAX_SIDE_HARD) -> Image.Image:
+    if max(img.size) <= cap:
+        return img
+    img = img.copy()
+    img.thumbnail((cap, cap), Image.LANCZOS)
+    return img
+
+def _resize_keep_ratio(img: Image.Image, long_side: int) -> Image.Image:
+    if max(img.size) <= long_side:
+        return img
+    img = img.copy()
+    img.thumbnail((long_side, long_side), Image.LANCZOS)
+    return img
+
+def _hash_image_bytes(img: Image.Image) -> str:
+    with io.BytesIO() as bio:
+        img.save(bio, format="PNG", optimize=False)
+        return hashlib.md5(bio.getvalue()).hexdigest()
+
+def finalize_image(img: Image.Image) -> Image.Image:
+    """Apply MAX_SIDE_HARD cap first, then cache-aware LONG_SIDE resize."""
+    img = _cap_max_side(img, MAX_SIDE_HARD)
+    target = LONG_SIDE
+    if max(img.size) <= target:
+        return img.convert("RGB")
+    h = _hash_image_bytes(img) + f"_{target}"
+    path = os.path.join(RESIZE_CACHE_DIR, h + ".png")
+    if os.path.exists(path):
+        return Image.open(path).convert("RGB")
+    out = _resize_keep_ratio(img, target)
+    out.save(path, format="PNG")
+    return out.convert("RGB")
 
 SYSTEM_PROMPT = (
     "You are a single vision–language assistant. You will receive either an image or text, and optionally a question.\n"
@@ -202,38 +266,72 @@ def build_train_valid(out_root: str,
 # Prompt builder (single path)
 # =============================
 
-def load_image_any(src) -> Image.Image:
-    """Load PIL.Image from local path, URL, bytes, base64 data URI, numpy array, or PIL.Image."""
-    # bytes / bytearray
-    if isinstance(src, (bytes, bytearray)):
-        return Image.open(io.BytesIO(src)).convert("RGB")
-    # base64 data URI string
-    if isinstance(src, str) and src.startswith("data:image/"):
+def load_image_any(input_obj) -> Image.Image:
+    """Robust loader: bytes / data URI / raw base64 / URL / local / numpy / PIL.Image.
+    Falls back to black 1x1 on failure (for training stability).
+    """
+    try:
+        # bytes-like
+        if isinstance(input_obj, (bytes, bytearray)):
+            return finalize_image(Image.open(io.BytesIO(input_obj)).convert("RGB"))
+
+        # string inputs
+        if isinstance(input_obj, str):
+            s = input_obj.strip()
+
+            # data URI
+            if s.startswith("data:image"):
+                try:
+                    b64 = s.split(",", 1)[1]
+                    return finalize_image(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
+                except Exception:
+                    pass
+
+            # raw base64 (no prefix)
+            if looks_like_base64(s):
+                try:
+                    return finalize_image(Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB"))
+                except Exception:
+                    # padding fix attempt
+                    missing = len(s) % 4
+                    if missing:
+                        s_padded = s + ("=" * (4 - missing))
+                        return finalize_image(Image.open(io.BytesIO(base64.b64decode(s_padded))).convert("RGB"))
+
+            # URL
+            if is_url(s):
+                req = Request(s, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=URL_TIMEOUT) as r:
+                    raw = r.read()
+                return finalize_image(Image.open(io.BytesIO(raw)).convert("RGB"))
+
+            # local path (optionally join base)
+            p = s
+            if not os.path.isabs(p) and IMG_BASE:
+                p = os.path.join(IMG_BASE, p)
+            return finalize_image(Image.open(p).convert("RGB"))
+
+        # numpy array
         try:
-            header, b64 = src.split(",", 1)
-            return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+            import numpy as _np
+            if isinstance(input_obj, _np.ndarray):
+                arr = input_obj
+                if arr.dtype != _np.uint8:
+                    arr = arr.astype(_np.uint8)
+                if arr.ndim == 2:
+                    return finalize_image(Image.fromarray(arr, "L").convert("RGB"))
+                return finalize_image(Image.fromarray(arr))
         except Exception:
             pass
-    # http(s) URL
-    if isinstance(src, str) and (src.startswith("http://") or src.startswith("https://")):
-        resp = requests.get(src, timeout=20)
-        resp.raise_for_status()
-        return Image.open(io.BytesIO(resp.content)).convert("RGB")
-    # numpy array
-    try:
-        import numpy as _np
-        if isinstance(src, _np.ndarray):
-            if src.dtype != _np.uint8:
-                src = src.astype(_np.uint8)
-            if src.ndim == 2:
-                return Image.fromarray(src, "L").convert("RGB")
-            return Image.fromarray(src)
+
+        # PIL.Image passthrough
+        if isinstance(input_obj, Image.Image):
+            return finalize_image(input_obj.convert("RGB"))
+
     except Exception:
-        pass
-    # local path or already PIL
-    if isinstance(src, Image.Image):
-        return src.convert("RGB")
-    return Image.open(src).convert("RGB")
+        return Image.new("RGB", (1, 1), (0, 0, 0))
+
+    return Image.new("RGB", (1, 1), (0, 0, 0))
 
 
 def build_messages(inp_type: str, task: str, inp: str, question: str, output: Optional[str] = None,
@@ -259,7 +357,25 @@ def build_messages(inp_type: str, task: str, inp: str, question: str, output: Op
     return msgs
 
 
-def extract_and_load_images(messages: List[Dict[str, Any]]) -> Tuple[List[Image.Image], List[Dict[str, Any]]]:
+def extract_and_load_images(messages: List[Dict[str, Any]]):
+    images = []
+    msgs = []
+    for msg in messages:
+        if isinstance(msg.get("content"), list):
+            new_list = []
+            for c in msg["content"]:
+                if isinstance(c, dict) and c.get("type") == "image":
+                    img_src = c.get("image")
+                    pil = img_src if isinstance(img_src, Image.Image) else load_image_any(img_src)
+                    pil = finalize_image(pil)
+                    images.append(pil)
+                    new_list.append({"type": "image", "image": pil})
+                else:
+                    new_list.append(c)
+            msgs.append({"role": msg["role"], "content": new_list})
+        else:
+            msgs.append(msg)
+    return images, msgs -> Tuple[List[Image.Image], List[Dict[str, Any]]]:
     images: List[Image.Image] = []
     msgs = []
     for msg in messages:
