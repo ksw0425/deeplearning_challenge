@@ -43,6 +43,9 @@ import numpy as np
 from PIL import Image
 import requests
 import base64
+import re, csv, hashlib
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
 from sklearn.model_selection import StratifiedShuffleSplit
 
@@ -68,6 +71,14 @@ SYSTEM_PROMPT = (
     "Always reply in English in a single, unified style across tasks.\n"
     "If the answer cannot be determined from the provided input, output exactly: unknown."
 )
+
+# Image loader constants (aligned with inference notebook)
+LONG_SIDE = 1280
+MAX_SIDE_HARD = 3500
+URL_TIMEOUT = 20
+IMG_BASE = None  # set to a base dir if your dataset uses relative paths
+RESIZE_CACHE_DIR = "/tmp/img_resized_cache"
+os.makedirs(RESIZE_CACHE_DIR, exist_ok=True)
 
 # =============================
 # Utils
@@ -202,78 +213,89 @@ def build_train_valid(out_root: str,
 # Prompt builder (single path)
 # =============================
 
-def load_image_any(src) -> Image.Image:
-    """Load PIL.Image from local path, URL, bytes, raw/base64 string, data URI, numpy array, or PIL.Image.
-    Robust to Parquet fields storing images as raw base64 strings without a data-URI prefix.
-    """
-    # bytes-like
-    if isinstance(src, (bytes, bytearray)):
-        return Image.open(io.BytesIO(src)).convert("RGB")
+# --- helpers copied/adapted from inference notebook ---
+_b64_re = re.compile(r'^[A-Za-z0-9+/=
 
-    # strings (data-URI, URL, or raw base64)
-    if isinstance(src, str):
-        s = src.strip()
-        # 1) data URI
-        if s.startswith("data:image/"):
-            try:
-                header, b64 = s.split(",", 1)
-                return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-            except Exception:
-                pass
-        # 2) http(s) URL
-        if s.startswith("http://") or s.startswith("https://"):
-            resp = requests.get(s, timeout=20)
-            resp.raise_for_status()
-            return Image.open(io.BytesIO(resp.content)).convert("RGB")
-        # 3) raw base64 without prefix (common in Parquet)
-        try:
-            b = base64.b64decode(s, validate=True)
-            if len(b) > 8:
-                magic2 = b[:2]
-                magic4 = b[:4]
-                magic8 = b[:8]
-                if (
-                    magic8.startswith(b"PNG") or      # PNG
-                    magic2 == b"ÿØ" or            # JPEG
-                    magic4 == b"RIFF" or                  # WEBP/AVI container
-                    magic4 == b"GIF8" or                  # GIF
-                    magic2 == b"BM"                       # BMP
-                ):
-                    return Image.open(io.BytesIO(b)).convert("RGB")
-        except Exception:
-            pass
-        # 4) local path fallback
-        try:
-            return Image.open(s).convert("RGB")
-        except Exception:
-            # final attempt: sometimes base64 lacks padding; try adding '=' padding
-            try:
-                missing = len(s) % 4
-                if missing:
-                    s_padded = s + ("=" * (4 - missing))
-                    b = base64.b64decode(s_padded)
-                    return Image.open(io.BytesIO(b)).convert("RGB")
-            except Exception:
-                raise
+]+$')
 
-    # numpy array
+def looks_like_base64(s: str, min_len: int = 128) -> bool:
+    if not (isinstance(s, str) and len(s) >= min_len and _b64_re.match(s)):
+        return False
     try:
-        import numpy as _np
-        if isinstance(src, _np.ndarray):
-            if src.dtype != _np.uint8:
-                src = src.astype(_np.uint8)
-            if src.ndim == 2:
-                return Image.fromarray(src, "L").convert("RGB")
-            return Image.fromarray(src)
+        head = base64.b64decode(s[:4096], validate=True)
+        return head.startswith(b"PNG") or head.startswith(b"ÿØ")
     except Exception:
-        pass
+        return False
 
-    # PIL.Image passthrough
-    if isinstance(src, Image.Image):
-        return src.convert("RGB")
+def is_url(path: str) -> bool:
+    try:
+        return urlparse(str(path)).scheme in ("http", "https")
+    except Exception:
+        return False
 
-    # Fallback
-    return Image.open(src).convert("RGB")
+def _cap_max_side(img: Image.Image, cap=MAX_SIDE_HARD) -> Image.Image:
+    if max(img.size) <= cap:
+        return img
+    img = img.copy()
+    img.thumbnail((cap, cap), Image.LANCZOS)
+    return img
+
+def _resize_keep_ratio(img: Image.Image, long_side: int) -> Image.Image:
+    if max(img.size) <= long_side:
+        return img
+    img = img.copy()
+    img.thumbnail((long_side, long_side), Image.LANCZOS)
+    return img
+
+def _hash_image_bytes(img: Image.Image) -> str:
+    with io.BytesIO() as bio:
+        img.save(bio, format="PNG", optimize=False)
+        return hashlib.md5(bio.getvalue()).hexdigest()
+
+def finalize_image(img: Image.Image) -> Image.Image:
+    img = _cap_max_side(img, MAX_SIDE_HARD)
+    target = LONG_SIDE
+    if max(img.size) <= target:
+        return img
+    h = _hash_image_bytes(img) + f"_{target}"
+    path = os.path.join(RESIZE_CACHE_DIR, h + ".png")
+    if os.path.exists(path):
+        return Image.open(path).convert("RGB")
+    out = _resize_keep_ratio(img, target)
+    out.save(path, format="PNG")
+    return out
+
+
+def load_image_any(input_obj) -> Image.Image:
+    """Match inference loader semantics: bytes/data-URI/raw base64/URL/local path.
+    On failure returns a 1x1 black image instead of raising.
+    """
+    try:
+        if isinstance(input_obj, (bytes, bytearray)):
+            return finalize_image(Image.open(io.BytesIO(input_obj)).convert("RGB"))
+        if isinstance(input_obj, str):
+            s = input_obj.strip()
+            # data URI
+            if s.startswith("data:image"):
+                b64 = s.split(",", 1)[1]
+                return finalize_image(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
+            # raw base64
+            if looks_like_base64(s):
+                return finalize_image(Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB"))
+            # URL
+            if is_url(s):
+                req = Request(s, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=URL_TIMEOUT) as r:
+                    raw = r.read()
+                return finalize_image(Image.open(io.BytesIO(raw)).convert("RGB"))
+            # local path (optionally join base)
+            p = s
+            if not os.path.isabs(p) and IMG_BASE:
+                p = os.path.join(IMG_BASE, p)
+            return finalize_image(Image.open(p).convert("RGB"))
+    except Exception:
+        return Image.new("RGB", (1, 1), (0, 0, 0))
+    return Image.new("RGB", (1, 1), (0, 0, 0))
 
 
 def build_messages(inp_type: str, task: str, inp: str, question: str, output: Optional[str] = None,
