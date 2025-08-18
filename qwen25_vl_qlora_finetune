@@ -1,0 +1,393 @@
+# Qwen2.5‑VL‑7B — Unified Multitask Fine‑tuning (QLoRA, single adapter)
+# bitsandbytes==0.47.0, transformers==4.55.2, peft>=0.14.0
+# Dataset: pre‑split train.parquet / valid.parquet with fields
+#   {id, input_type, task, input, output, question}
+#   (auto‑rename input_tpye -> input_type)
+#
+# Notes
+# - Single adapter, single unified prompt & path (competition rules)
+# - Label masking: only supervise assistant tokens
+# - Phase 1: language blocks only (q/k/v/o + MLP); vision blocks frozen
+# - QLoRA: nf4 + double quant, compute=bfloat16
+
+import os, io, re, csv, json, base64, hashlib, warnings, argparse
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional, Tuple
+from pathlib import Path
+
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from PIL import Image, ImageFile
+
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    BitsAndBytesConfig,
+    Trainer,
+    TrainingArguments,
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+
+# ==========================
+# Safety / Env knobs
+# ==========================
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb=128")
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
+
+# ==========================
+# System Prompt (unified)
+# ==========================
+SYSTEM_PROMPT = (
+    "You are a single vision–language assistant. You will receive either an image or text, and optionally a question.\n"
+    "Always reply in English. Use one of the following behaviors, but keep a unified output style across all tasks.\n\n"
+    "GENERAL\n- Never use markdown, code fences, or quotes.\n- Be concise and factual. If the answer cannot be determined from the input, output: unknown.\n- When reading text inside images, transcribe characters exactly (keep case, spacing, and punctuation).\n\n"
+    "CAPTIONING\n- Output 1–2 sentences describing salient objects, attributes, and relations that are visibly present. Avoid hallucinations.\n\n"
+    "VQA (for image-based questions or simple text questions)\n- Output ONLY the answer string. No explanations. No extra words or punctuation.\n- For yes/no, reply exactly: yes or no (lowercase).\n- For dates, numbers, names in the image, copy them verbatim.\n\n"
+    "TEXT QA (Span-Extraction Mode)\n-\n\n"
+    "MATH REASONING\n- Provide a very brief calculation (one short line), then end with exactly one final line:\n  #### <number>\n- Do not use '####' in any non-math task.\n\n"
+    "SUMMARIZATION\n- Output 2–3 sentences focusing on key facts. Avoid opinions or unsupported details."
+)
+
+# ==========================
+# Image helpers (same as inference)
+# ==========================
+from urllib.parse import urlparse
+from urllib.request import urlopen, Request
+
+URL_TIMEOUT = 5
+MAX_SIDE_HARD = 3500
+LONG_SIDE = 1280
+RESIZE_CACHE_DIR = "/tmp/img_resized_cache"
+os.makedirs(RESIZE_CACHE_DIR, exist_ok=True)
+
+_b64_re = re.compile(r'^[A-Za-z0-9+/=\n\r]+$')
+
+def looks_like_base64(s: str, min_len: int = 128) -> bool:
+    if not (isinstance(s, str) and len(s) >= min_len and _b64_re.match(s)):
+        return False
+    try:
+        head = base64.b64decode(s[:4096], validate=True)
+        return head.startswith(b"\x89PNG") or head.startswith(b"\xff\xd8")
+    except Exception:
+        return False
+
+def is_url(path: str) -> bool:
+    try:
+        return urlparse(str(path)).scheme in ("http", "https")
+    except Exception:
+        return False
+
+def _cap_max_side(img: Image.Image, cap=MAX_SIDE_HARD) -> Image.Image:
+    if max(img.size) <= cap: return img
+    img = img.copy(); img.thumbnail((cap, cap), Image.LANCZOS); return img
+
+def _resize_keep_ratio(img: Image.Image, long_side: int) -> Image.Image:
+    if max(img.size) <= long_side: return img
+    img = img.copy(); img.thumbnail((long_side, long_side), Image.LANCZOS); return img
+
+
+def _hash_image_bytes(img: Image.Image) -> str:
+    with io.BytesIO() as bio:
+        img.save(bio, format="PNG", optimize=False)
+        return hashlib.md5(bio.getvalue()).hexdigest()
+
+
+def finalize_image(img: Image.Image) -> Image.Image:
+    img = _cap_max_side(img, MAX_SIDE_HARD)
+    target = LONG_SIDE
+    if max(img.size) <= target: return img
+    h = _hash_image_bytes(img) + f"_{target}"
+    path = os.path.join(RESIZE_CACHE_DIR, h + ".png")
+    if os.path.exists(path): return Image.open(path).convert("RGB")
+    out = _resize_keep_ratio(img, target)
+    out.save(path, format="PNG")
+    return out
+
+
+def load_image(input_obj, img_base: Optional[str] = None) -> Image.Image:
+    try:
+        if isinstance(input_obj, (bytes, bytearray)):
+            return _cap_max_side(Image.open(io.BytesIO(input_obj)).convert("RGB"))
+        if isinstance(input_obj, str):
+            if input_obj.startswith("data:image"):
+                b64 = input_obj.split(",", 1)[1]
+                return _cap_max_side(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
+            if looks_like_base64(input_obj):
+                return _cap_max_side(Image.open(io.BytesIO(base64.b64decode(input_obj))).convert("RGB"))
+            p = str(input_obj)
+            if is_url(p):
+                req = Request(p, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=URL_TIMEOUT) as r:
+                    raw = r.read()
+                return _cap_max_side(Image.open(io.BytesIO(raw)).convert("RGB"))
+            if img_base and not os.path.isabs(p):
+                p = os.path.join(img_base, p)
+            return _cap_max_side(Image.open(p).convert("RGB"))
+    except Exception:
+        return Image.new("RGB", (1,1), (0,0,0))
+    return Image.new("RGB", (1,1), (0,0,0))
+
+# ==========================
+# Prompt helpers (unified path)
+# ==========================
+
+def build_user_prompt(task: str, input_type: str, the_input: str, question: Optional[str]) -> str:
+    t = (task or "").strip().lower()
+    it = (input_type or "text").strip().lower()
+    q = (question or "").strip()
+    lines = [
+        f"Task: {t}",
+        f"InputType: {it}",
+        f"Question: {q}" if q else "Question:",
+    ]
+    lines.append("Input:\n" + (the_input or "") if it == "text" else "Input: <image>")
+    return "\n".join(lines)
+
+# ==========================
+# Dataset
+# ==========================
+class VLMultiTaskDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, processor: AutoProcessor, img_base: Optional[str]=None, max_length: int=2048):
+        self.df = df.reset_index(drop=True).copy()
+        self.processor = processor
+        self.img_base = img_base
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.df)
+
+    def _make_messages(self, row: pd.Series):
+        user_prompt = build_user_prompt(str(row["task"]), str(row["input_type"]), str(row["input"]), row.get("question", ""))
+        if (row.get("input_type", "text") or "text").lower() == "image":
+            user_content = [{"type": "image"}, {"type": "text", "text": user_prompt}]
+        else:
+            user_content = [{"type": "text", "text": user_prompt}]
+        messages = [
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+            {"role": "user",   "content": user_content},
+            {"role": "assistant", "content": [{"type": "text", "text": str(row["output"]).strip()}]},
+        ]
+        return messages
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        messages = self._make_messages(row)
+
+        # images (if any)
+        images = None
+        if (row.get("input_type", "text") or "text").lower() == "image":
+            img = load_image(row["input"], self.img_base)
+            img = finalize_image(img)
+            images = [img]
+
+        # Texts for full supervision and for prompt length (mask)
+        text_full = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        text_prompt_only = self.processor.apply_chat_template(messages[:-1], tokenize=False, add_generation_prompt=True)
+
+        enc_full = self.processor(
+            text=[text_full],
+            images=images,
+            padding=False,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        enc_prompt = self.processor(
+            text=[text_prompt_only],
+            images=images,
+            padding=False,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+        # Build labels with mask (only supervise assistant part)
+        input_ids = enc_full["input_ids"][0]
+        labels = input_ids.clone()
+        prompt_len = enc_prompt["input_ids"].shape[1]
+        labels[:prompt_len] = -100
+
+        item: Dict[str, Any] = {k: v[0] for k, v in enc_full.items() if isinstance(v, torch.Tensor)}
+        item["labels"] = labels
+        return item
+
+# ==========================
+# Collator (pad by processor)
+# ==========================
+@dataclass
+class DataCollator:
+    processor: AutoProcessor
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        batch = {}
+        # Separate tensor/non‑tensor to let processor pad safely
+        keys = set().union(*[f.keys() for f in features])
+        to_pad = {k: [f[k] for f in features if k in f and isinstance(f[k], torch.Tensor)] for k in keys}
+        # processor handles input_ids/attention_mask/pixel_values padding
+        processed = self.processor.pad(
+            {k: to_pad[k] for k in ("input_ids","attention_mask","pixel_values") if k in to_pad and len(to_pad[k])>0},
+            padding=True,
+            return_tensors="pt",
+        )
+        batch.update(processed)
+        if "labels" in keys:
+            # pad labels with -100
+            max_len = batch["input_ids"].shape[1]
+            labels = []
+            for f in features:
+                lab = f["labels"]
+                if lab.numel() < max_len:
+                    pad = torch.full((max_len - lab.numel(),), -100, dtype=lab.dtype)
+                    lab = torch.cat([lab, pad], dim=0)
+                labels.append(lab)
+            batch["labels"] = torch.stack(labels)
+        return batch
+
+# ==========================
+# Build / Train
+# ==========================
+
+def train(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Processor & base model (4‑bit QLoRA)
+    processor = AutoProcessor.from_pretrained(args.base_model, trust_remote_code=True)
+
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.base_model,
+        trust_remote_code=True,
+        quantization_config=bnb_cfg,
+        device_map=None,  # single‑GPU train
+    )
+
+    # Prepare for k‑bit LoRA (phase 1: LLM‑centric)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+    lora_cfg = LoraConfig(
+        r=64, lora_alpha=128, lora_dropout=0.05, bias="none",
+        target_modules=["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"],
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_cfg)
+
+    # Datasets
+    train_df = pd.read_parquet(args.train_path)
+    valid_df = pd.read_parquet(args.valid_path)
+
+    for df in (train_df, valid_df):
+        if "input_type" not in df.columns and "input_tpye" in df.columns:
+            df.rename(columns={"input_tpye": "input_type"}, inplace=True)
+
+    train_ds = VLMultiTaskDataset(train_df, processor, img_base=args.img_base, max_length=args.max_length)
+    valid_ds = VLMultiTaskDataset(valid_df, processor, img_base=args.img_base, max_length=args.max_length)
+
+    collator = DataCollator(processor)
+
+    # TrainingArguments profiles
+    profiles = {
+        "dev": dict(
+            num_train_epochs=1,
+            per_device_train_batch_size=1,
+            per_device_eval_batch_size=1,
+            gradient_accumulation_steps=8,
+            learning_rate=1e-4,
+            warmup_ratio=0.03,
+            logging_steps=50,
+            eval_steps=500,
+            save_steps=1000,
+            max_steps=-1,
+        ),
+        "base": dict(
+            num_train_epochs=2,
+            per_device_train_batch_size=1,
+            per_device_eval_batch_size=1,
+            gradient_accumulation_steps=16,
+            learning_rate=8e-5,
+            warmup_ratio=0.05,
+            logging_steps=50,
+            eval_steps=800,
+            save_steps=800,
+            max_steps=-1,
+        ),
+        "long": dict(
+            num_train_epochs=3,
+            per_device_train_batch_size=1,
+            per_device_eval_batch_size=1,
+            gradient_accumulation_steps=32,
+            learning_rate=5e-5,
+            warmup_ratio=0.06,
+            logging_steps=50,
+            eval_steps=1000,
+            save_steps=1000,
+            max_steps=-1,
+        ),
+    }
+    prof = profiles[args.profile]
+
+    train_args = TrainingArguments(
+        output_dir=args.out_dir,
+        remove_unused_columns=False,
+        fp16=False,
+        bf16=True,
+        gradient_checkpointing=True,
+        optim="paged_adamw_32bit",
+        weight_decay=0.0,
+        lr_scheduler_type="cosine",
+        save_total_limit=2,
+        evaluation_strategy="steps",
+        save_strategy="steps",
+        logging_dir=os.path.join(args.out_dir, "logs"),
+        report_to=["none"],
+        do_eval=True,
+        **prof,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=train_args,
+        train_dataset=train_ds,
+        eval_dataset=valid_ds,
+        data_collator=collator,
+    )
+
+    trainer.train(resume_from_checkpoint=args.resume_from)
+
+    # Save only adapter (single‑adapter rule)
+    adapter_dir = os.path.join(args.out_dir, "adapter")
+    os.makedirs(adapter_dir, exist_ok=True)
+    model.save_pretrained(adapter_dir)
+
+    # Save processor to ensure reproducible inference
+    processor.save_pretrained(args.out_dir)
+
+    print(f"[Saved] LoRA adapter => {adapter_dir}")
+    print(f"[Saved] Processor    => {args.out_dir}")
+
+# ==========================
+# CLI
+# ==========================
+
+def build_parser():
+    p = argparse.ArgumentParser(description="Qwen2.5‑VL‑7B unified multitask fine‑tuning (QLoRA)")
+    p.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
+    p.add_argument("--train_path", type=str, default="train.parquet")
+    p.add_argument("--valid_path", type=str, default="valid.parquet")
+    p.add_argument("--img_base", type=str, default="/content")
+    p.add_argument("--out_dir", type=str, default="OUT_DIR/qlora-vl-qwen25-7b")
+    p.add_argument("--max_length", type=int, default=2048)
+    p.add_argument("--profile", choices=["dev","base","long"], default="base")
+    p.add_argument("--resume_from", type=str, default=None)
+    return p
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
+    train(args)
