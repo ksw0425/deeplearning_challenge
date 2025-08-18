@@ -497,10 +497,10 @@ def train_model(
     os.makedirs(run_dir, exist_ok=True)
 
     processor = AutoProcessor.from_pretrained(
-    base_model,
-    trust_remote_code=True,
-    min_pixels=256 * 28 * 28,   # 약 200k 픽셀 (하한선)
-    max_pixels=1024 * 28 * 28   # 약 800k 픽셀 (상한선)
+        base_model,
+        trust_remote_code=True,
+        min_pixels=256*28*28,
+        max_pixels=1024*28*28,
     )
 
     tokenizer = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
@@ -623,7 +623,12 @@ def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: O
 
     model = PeftModel.from_pretrained(model, run_dir)
     model.eval()
-    processor = AutoProcessor.from_pretrained(run_dir, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        run_dir,    # adapter 저장 경로
+        trust_remote_code=True,
+        min_pixels=256*28*28,
+        max_pixels=1024*28*28,
+    )
     tok = getattr(processor, "tokenizer", None) or AutoTokenizer.from_pretrained(base_model, use_fast=True, trust_remote_code=True)
 
     msgs = [{"role":"system","content":[{"type":"text","text":SYSTEM_PROMPT}]}]
