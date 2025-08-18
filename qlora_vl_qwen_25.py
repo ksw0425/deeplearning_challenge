@@ -204,7 +204,7 @@ def build_train_valid(out_root: str,
 
 def load_image_any(src) -> Image.Image:
     """Load PIL.Image from local path, URL, bytes, raw/base64 string, data URI, numpy array, or PIL.Image.
-    This is robust to Parquet fields that store images as raw base64 strings without a data-URI prefix.
+    Robust to Parquet fields storing images as raw base64 strings without a data-URI prefix.
     """
     # bytes-like
     if isinstance(src, (bytes, bytearray)):
@@ -226,7 +226,6 @@ def load_image_any(src) -> Image.Image:
             resp.raise_for_status()
             return Image.open(io.BytesIO(resp.content)).convert("RGB")
         # 3) raw base64 without prefix (common in Parquet)
-        # try a safe decode and validate by magic bytes
         try:
             b = base64.b64decode(s, validate=True)
             if len(b) > 8:
@@ -234,7 +233,7 @@ def load_image_any(src) -> Image.Image:
                 magic4 = b[:4]
                 magic8 = b[:8]
                 if (
-                    magic8.startswith(b"PNG") or
+                    magic8.startswith(b"PNG") or      # PNG
                     magic2 == b"ÿØ" or            # JPEG
                     magic4 == b"RIFF" or                  # WEBP/AVI container
                     magic4 == b"GIF8" or                  # GIF
