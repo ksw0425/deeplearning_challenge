@@ -47,7 +47,7 @@ import base64
 from sklearn.model_selection import StratifiedShuffleSplit
 
 from transformers import (
-    AutoModelForCausalLM,
+    AutoModelForCausalLM, AutoModelForVision2Seq,
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -487,16 +487,28 @@ def train_model(
 
     # Model 4-bit
     print(f"[Load] {base_model} in 4-bit (nf4, bfloat16 compute)")
-    bnb_config = make_bnb_config()
-    model = AutoModelForCausalLM.from_pretrained(
+bnb_config = make_bnb_config()
+try:
+    model = AutoModelForVision2Seq.from_pretrained(
         base_model,
         device_map="auto",
         torch_dtype=torch.bfloat16,
         quantization_config=bnb_config,
         trust_remote_code=True,
     )
-    model.config.use_cache = False
-    model = prepare_model_for_kbit_training(model)
+except Exception as _e1:
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            quantization_config=bnb_config,
+            trust_remote_code=True,
+        )
+    except Exception as _e2:
+        raise RuntimeError(f"Failed to load VLM base model for {base_model}: {_e1} / {_e2}")
+model.config.use_cache = False
+model = prepare_model_for_kbit_training(model)
 
     # LoRA (language modules only)
     peft_cfg = make_lora_config(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, target_modules=target_modules)
@@ -574,7 +586,10 @@ def train_model(
 
 def quick_infer(run_dir: str, base_model: str = DEFAULT_BASE_MODEL, image_url: Optional[str] = None, question: Optional[str] = None):
     from peft import PeftModel
-    model = AutoModelForCausalLM.from_pretrained(base_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
+    try:
+        model = AutoModelForVision2Seq.from_pretrained(base_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(base_model, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True)
     model = PeftModel.from_pretrained(model, run_dir)
     model.eval()
 
