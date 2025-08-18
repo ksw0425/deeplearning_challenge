@@ -264,6 +264,7 @@ def train(args):
 
     model = AutoModelForImageTextToText.from_pretrained(
         args.base_model,
+        config=cfg,
         trust_remote_code=True,
         quantization_config=bnb_cfg,
         device_map=None,
