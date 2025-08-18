@@ -84,6 +84,7 @@ def looks_like_base64(s: str, min_len: int = 128) -> bool:
         return False
     try:
         head = base64.b64decode(s[:4096], validate=True)
+        # PNG  'PNG', JPEG ÿØ
         return head.startswith(b"PNG") or head.startswith(b"ÿØ")
     except Exception:
         return False
@@ -116,6 +117,16 @@ def _hash_image_bytes(img: Image.Image) -> str:
 def finalize_image(img: Image.Image) -> Image.Image:
     """Apply MAX_SIDE_HARD cap first, then cache-aware LONG_SIDE resize."""
     img = _cap_max_side(img, MAX_SIDE_HARD)
+    target = LONG_SIDE
+    if max(img.size) <= target:
+        return img.convert("RGB")
+    h = _hash_image_bytes(img) + f"_{target}"
+    path = os.path.join(RESIZE_CACHE_DIR, h + ".png")
+    if os.path.exists(path):
+        return Image.open(path).convert("RGB")
+    out = _resize_keep_ratio(img, target)
+    out.save(path, format="PNG")
+    return out.convert("RGB")
     target = LONG_SIDE
     if max(img.size) <= target:
         return img.convert("RGB")
@@ -358,11 +369,11 @@ def build_messages(inp_type: str, task: str, inp: str, question: str, output: Op
 
 
 def extract_and_load_images(messages: List[Dict[str, Any]]):
-    images = []
-    msgs = []
+    images: List[Image.Image] = []
+    msgs: List[Dict[str, Any]] = []
     for msg in messages:
         if isinstance(msg.get("content"), list):
-            new_list = []
+            new_list: List[Dict[str, Any]] = []
             for c in msg["content"]:
                 if isinstance(c, dict) and c.get("type") == "image":
                     img_src = c.get("image")
@@ -375,32 +386,9 @@ def extract_and_load_images(messages: List[Dict[str, Any]]):
             msgs.append({"role": msg["role"], "content": new_list})
         else:
             msgs.append(msg)
-    return images, msgs -> Tuple[List[Image.Image], List[Dict[str, Any]]]:
-    images: List[Image.Image] = []
-    msgs = []
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            new_list = []
-            for c in msg["content"]:
-                if isinstance(c, dict) and c.get("type") == "image":
-                    img_src = c.get("image")
-                    pil = img_src if isinstance(img_src, Image.Image) else load_image_any(img_src)
-                    images.append(pil)
-                    new_list.append({"type": "image", "image": pil})
-                else:
-                    new_list.append(c)
-            msgs.append({"role": msg["role"], "content": new_list})
-        else:
-            msgs.append(msg)
     return images, msgs
 
-
-# =============================
-# Dataset with label masking
-# =============================
-
-class MMDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, processor: AutoProcessor, add_task_hint: bool = False):
+def __init__(self, df: pd.DataFrame, processor: AutoProcessor, add_task_hint: bool = False):
         self.df = df.reset_index(drop=True)
         self.processor = processor
         self.add_task_hint = add_task_hint
