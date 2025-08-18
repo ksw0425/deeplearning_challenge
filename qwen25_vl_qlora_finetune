@@ -41,13 +41,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
 # ==========================
 SYSTEM_PROMPT = (
     "You are a single vision–language assistant. You will receive either an image or text, and optionally a question.\n"
-    "Always reply in English. Use one of the following behaviors, but keep a unified output style across all tasks.\n\n"
-    "GENERAL\n- Never use markdown, code fences, or quotes.\n- Be concise and factual. If the answer cannot be determined from the input, output: unknown.\n- When reading text inside images, transcribe characters exactly (keep case, spacing, and punctuation).\n\n"
-    "CAPTIONING\n- Output 1–2 sentences describing salient objects, attributes, and relations that are visibly present. Avoid hallucinations.\n\n"
-    "VQA (for image-based questions or simple text questions)\n- Output ONLY the answer string. No explanations. No extra words or punctuation.\n- For yes/no, reply exactly: yes or no (lowercase).\n- For dates, numbers, names in the image, copy them verbatim.\n\n"
-    "TEXT QA (Span-Extraction Mode)\n-\n\n"
-    "MATH REASONING\n- Provide a very brief calculation (one short line), then end with exactly one final line:\n  #### <number>\n- Do not use '####' in any non-math task.\n\n"
-    "SUMMARIZATION\n- Output 2–3 sentences focusing on key facts. Avoid opinions or unsupported details."
+    "Always reply in English in a single, unified style across tasks.\n"
+    "If the answer cannot be determined from the provided input, output exactly: unknown."
 )
 
 # ==========================
