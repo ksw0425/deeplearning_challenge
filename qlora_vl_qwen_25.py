@@ -535,7 +535,6 @@ def train_model(
     p = resolve_profile(profile)
     print(f"[Profile] {profile} => {p}")
 
-    # Build TrainingArguments with backward/forward compatibility
     import inspect
     ta_kwargs = dict(
         output_dir=run_dir,
@@ -553,24 +552,24 @@ def train_model(
         gradient_checkpointing=True,
         report_to="none",
     )
-
+    
     sig = inspect.signature(TrainingArguments.__init__)
     def maybe(key, value):
         if key in sig.parameters and value is not None:
             ta_kwargs[key] = value
-
-    # evaluation-related
+    
+    # evaluation-related (only if supported by your transformers)
     eval_strategy = "steps" if eval_ds is not None else "no"
-    maybe("evaluation_strategy", eval_strategy)
-    maybe("eval_strategy", eval_strategy)  # some versions use this alias
+    maybe("evaluation_strategy", eval_strategy)   # new API
+    maybe("eval_strategy", eval_strategy)         # some older builds use this name
     maybe("eval_steps", p.get("eval_steps") if eval_ds is not None else None)
     maybe("load_best_model_at_end", bool(eval_ds))
     maybe("metric_for_best_model", "eval_loss" if eval_ds is not None else None)
     maybe("greater_is_better", False if eval_ds is not None else None)
-
-    # optimizer (fallback if not supported)
+    
+    # optimizer (only if supported; otherwise fallback to default AdamW)
     maybe("optim", "paged_adamw_8bit")
-
+    
     training_args = TrainingArguments(**ta_kwargs)
 
     trainer = Trainer(
