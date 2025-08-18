@@ -96,27 +96,25 @@ def read_any(path: str) -> pd.DataFrame:
 
 def to_unified_schema(df: pd.DataFrame, col_map: Optional[dict] = None) -> pd.DataFrame:
     """
-    Standardize to columns: [id, task, input_type, input, question, output]
-    input_type ∈ {"image", "text"}; input is image path/URL, raw bytes/base64, or text.
-    If `id` is missing, auto-generate stable ids.
+    Standardize to columns: [task, input_type, input, question, output]
+    input_type ∈ {"image", "text"}; input can be path/URL, raw bytes/base64, or text.
+    NOTE: We do NOT require or auto-generate an `id` column.
     """
     df = df.copy()
     if col_map:
         df = df.rename(columns=col_map)
-    # required base columns (id optional)
+    # required base columns (no id)
     required_base = ["task","input_type","input"]
     for c in required_base:
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
-    if "id" not in df.columns:
-        df["id"] = [f"{df.loc[i, 'task']}_{i}" for i in range(len(df))]
     if "question" not in df.columns:
         df["question"] = ""
     if "output" not in df.columns:
         df["output"] = ""
 
     # types (keep raw input for images if bytes)
-    for c in ["id","task","input_type","question","output"]:
+    for c in ["task","input_type","question","output"]:
         df[c] = df[c].astype(str)
 
     # normalize input_type
@@ -127,7 +125,7 @@ def to_unified_schema(df: pd.DataFrame, col_map: Optional[dict] = None) -> pd.Da
         return "text" if "text" in x or x == "text" else x
     df["input_type"] = df["input_type"].map(_norm_it)
 
-    return df[["id","task","input_type","input","question","output"]]
+    return df[["task","input_type","input","question","output"]]
 
 
 def join_labels(inputs_df: pd.DataFrame, labels_df: pd.DataFrame,
@@ -509,7 +507,7 @@ def train_model(
     train_df = read_any(train_file)
     valid_df = read_any(valid_file) if valid_file else None
 
-    required = {"id","task","input_type","input","question","output"}
+    required = {"task","input_type","input","question","output"}
     if not required.issubset(set(train_df.columns)):
         missing = required - set(train_df.columns)
         raise ValueError(f"Train file missing columns: {missing}")
