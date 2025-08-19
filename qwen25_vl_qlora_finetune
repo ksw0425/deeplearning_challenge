@@ -188,14 +188,30 @@ class MMDataset(Dataset):
         input_ids = enc_full["input_ids"][0]
         labels = input_ids.clone()
         prm_len = enc_prm["input_ids"].shape[-1]
-        labels[:prm_len] = -100  # supervise only assistant tokens
-
-        item = {k: v[0] for k, v in enc_full.items() if isinstance(v, torch.Tensor)}
-        item["labels"] = labels
-        # NOTE: do NOT squeeze non-tensor (like pixel_values list) here
-        for k, v in enc_full.items():
-            if k not in item:
-                item[k] = v
+        labels[:prm_len] = -100
+        
+        item = {
+            "input_ids": input_ids,
+            "attention_mask": enc_full["attention_mask"][0],
+            "labels": labels,
+        }
+        
+        # 🔧 pixel_values 정규화: (C,H,W) 또는 (N,C,H,W)만 허용
+        pv = enc_full.get("pixel_values", None)
+        
+        if isinstance(pv, list):
+            pv = pv[0] if len(pv) > 0 else None
+        
+        if isinstance(pv, torch.Tensor):
+            # (1,C,H,W) → (C,H,W)
+            if pv.dim() == 4 and pv.size(0) == 1:
+                pv = pv.squeeze(0)
+            # 채널 1개면 3채널로 확장
+            if pv.dim() == 3 and pv.size(0) == 1:
+                pv = pv.repeat(3, 1, 1)
+        
+            if pv.dim() == 3 or pv.dim() == 4:
+                item["pixel_values"] = pv
         return item
 
 @dataclass
