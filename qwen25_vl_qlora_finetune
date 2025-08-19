@@ -34,7 +34,7 @@ SYSTEM_PROMPT = (
 
 # ========= Image I/O =========
 from urllib.parse import urlparse
-from urllib.request import urlopen, Request
+#from urllib.request import urlopen, Request
 
 URL_TIMEOUT = 20
 LONG_SIDE = 1280
@@ -93,33 +93,38 @@ def finalize_image(img: Image.Image) -> Image.Image:
     return out
 
 def load_image_strict(input_obj) -> Image.Image:
-    """Load an image, raise on failure. No 1×1 fallbacks."""
+    """
+    로컬 경로, bytes, Base64로부터 이미지를 로드합니다.
+    URL 로딩 기능은 제거되었습니다.
+    """
     try:
         if isinstance(input_obj, (bytes, bytearray)):
+            # 1. raw bytes 데이터 처리
             img = Image.open(io.BytesIO(input_obj)).convert("RGB")
         elif isinstance(input_obj, str):
             s = input_obj.strip()
             if s.startswith("data:image"):
+                # 2. Data URL 형식의 Base64 처리
                 b64 = s.split(",", 1)[1]
                 img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
             elif looks_like_base64(s):
+                # 3. 순수 Base64 문자열 처리
                 img = Image.open(io.BytesIO(base64.b64decode(s))).convert("RGB")
-            elif is_url(s):
-                req = Request(s, headers={"User-Agent": "Mozilla/5.0"})
-                with urlopen(req, timeout=URL_TIMEOUT) as r:
-                    raw = r.read()
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
             else:
+                # 4. 로컬 파일 경로 처리 (URL 확인 로직 없음)
+                #    이제 `input` 열에 있는 다운로드된 이미지의 경로가 여기에 해당됩니다.
                 img = Image.open(s).convert("RGB")
         else:
-            raise TypeError(f"Unsupported image input type: {type(input_obj)}")
+            raise TypeError(f"지원하지 않는 이미지 입력 타입: {type(input_obj)}")
     except Exception as e:
-        raise RuntimeError(f"[ImageLoadError] {input_obj!r} -> {e}")
+        # 파일이 없거나 손상된 경우 에러 발생
+        raise RuntimeError(f"[ImageLoadError] 이미지를 불러오는 데 실패했습니다: {input_obj!r} -> {e}")
 
+    # 이미지 리사이즈 및 최종 처리
     img = finalize_image(img)
     w, h = img.size
     if min(w, h) < MIN_IMG_SIDE:
-        raise ValueError(f"[ImageTooSmall] {w}x{h} < {MIN_IMG_SIDE}")
+        raise ValueError(f"[ImageTooSmall] 이미지 크기가 너무 작습니다: {w}x{h} < {MIN_IMG_SIDE}")
     return img
 
 # ========= Prompt helpers =========
@@ -353,13 +358,13 @@ def train(
     profiles = {
         "dev":  dict(num_train_epochs=1, per_device_train_batch_size=1, per_device_eval_batch_size=1,
                      gradient_accumulation_steps=8,  learning_rate=1e-4, warmup_ratio=0.03,
-                     logging_steps=50, eval_steps=500, save_steps=1000, weight_decay=0.0),
+                     logging_steps=50, eval_steps=500, save_steps=100, weight_decay=0.0),
         "base": dict(num_train_epochs=2, per_device_train_batch_size=1, per_device_eval_batch_size=1,
                      gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
-                     logging_steps=50, eval_steps=800, save_steps=800,  weight_decay=0.0),
-        "long": dict(num_train_epochs=3, per_device_train_batch_size=1, per_device_eval_batch_size=1,
-                     gradient_accumulation_steps=32, learning_rate=5e-5, warmup_ratio=0.06,
-                     logging_steps=50, eval_steps=1000, save_steps=1000, weight_decay=0.0),
+                     logging_steps=50, eval_steps=800, save_steps=100,  weight_decay=0.0),
+        "long": dict(num_train_epochs=2, per_device_train_batch_size=2, per_device_eval_batch_size=2,
+                     gradient_accumulation_steps=8, learning_rate=8e-5, warmup_ratio=0.05,
+                     logging_steps=50, eval_steps=800, save_steps=100,  weight_decay=0.0),
     }
     p = profiles.get(profile, profiles["base"])
 
