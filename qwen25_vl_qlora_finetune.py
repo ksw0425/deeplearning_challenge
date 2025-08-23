@@ -356,9 +356,9 @@ def train(
     collator = QwenVLDataCollator(pad_token_id=tokenizer.pad_token_id)
 
     profiles = {
-        "dev":  dict(num_train_epochs=1, per_device_train_batch_size=1, per_device_eval_batch_size=1,
-                     gradient_accumulation_steps=8,  learning_rate=1e-4, warmup_ratio=0.03,
-                     logging_steps=50, eval_steps=500, save_steps=500, weight_decay=0.0),
+        "dev":  dict(num_train_epochs=2, per_device_train_batch_size=1, per_device_eval_batch_size=1,
+                     gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
+                     logging_steps=50, eval_steps=100, save_steps=100,  weight_decay=0.0),
         "base": dict(num_train_epochs=2, per_device_train_batch_size=1, per_device_eval_batch_size=1,
                      gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
                      logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.0),
@@ -367,7 +367,14 @@ def train(
                      logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.0),
     }
     p = profiles.get(profile, profiles["base"])
-
+    
+    # 디버깅: 선택된 프로파일 확인
+    print(f"\n[DEBUG] Selected profile: {profile}")
+    print(f"[DEBUG] Profile settings:")
+    print(f"  - eval_steps: {p.get('eval_steps', 'NOT SET')}")
+    print(f"  - save_steps: {p.get('save_steps', 'NOT SET')}")
+    print(f"  - Full profile: {p}\n")
+    
     # Build TrainingArguments with signature-check (4.55.2 safe)
     ta = dict(
         output_dir=out_dir,
@@ -394,7 +401,17 @@ def train(
     maybe_set("greater_is_better", False if eval_ds is not None else None)
 
     train_args = TrainingArguments(**ta)
-
+    
+    # 디버깅: TrainingArguments 객체에서 실제 값 확인
+    print(f"\n[DEBUG] TrainingArguments loaded values:")
+    print(f"  - eval_steps: {train_args.eval_steps}")
+    print(f"  - save_steps: {train_args.save_steps}")
+    print(f"  - eval_strategy: {getattr(train_args, 'eval_strategy', 'NOT SET')}")
+    print(f"  - logging_steps: {train_args.logging_steps}\n")
+    
+    # 학습 시작 전 최종 확인
+    input("Press Enter to continue with training...")  # 수동 확인용
+    
     init_kwargs = dict(
         model=model, args=train_args,
         train_dataset=train_ds, eval_dataset=eval_ds,
