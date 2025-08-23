@@ -356,14 +356,11 @@ def train(
     collator = QwenVLDataCollator(pad_token_id=tokenizer.pad_token_id)
 
     profiles = {
-        "dev":  dict(num_train_epochs=2, per_device_train_batch_size=1, per_device_eval_batch_size=1,
+        "dev":  dict(max_steps=4400, per_device_train_batch_size=1, per_device_eval_batch_size=1,
                      gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
                      logging_steps=50, eval_steps=100, save_steps=100,  weight_decay=0.0),
         "base": dict(num_train_epochs=2, per_device_train_batch_size=1, per_device_eval_batch_size=1,
                      gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
-                     logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.0),
-        "long": dict(num_train_epochs=2, per_device_train_batch_size=2, per_device_eval_batch_size=2,
-                     gradient_accumulation_steps=8, learning_rate=8e-5, warmup_ratio=0.05,
                      logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.0),
     }
     p = profiles.get(profile, profiles["base"])
@@ -424,7 +421,7 @@ def train(
         init_kwargs["tokenizer"] = tokenizer
 
     trainer = Trainer(**init_kwargs)
-    trainer.train()
+    trainer.train(resume_from_checkpoint="/content/drive/MyDrive/Colab Notebooks/wook/fine-tuning/datasets/qlora/qlora-out/checkpoint-3500")
 
     # Save adapter + processor/tokenizer
     adapter_dir = os.path.join(out_dir, "adapter")
