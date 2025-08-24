@@ -421,7 +421,7 @@ def train(
         init_kwargs["tokenizer"] = tokenizer
 
     trainer = Trainer(**init_kwargs)
-    trainer.train(resume_from_checkpoint="/content/drive/MyDrive/Colab Notebooks/wook/fine-tuning/datasets/qlora/qlora-out/checkpoint-3500")
+    trainer.train(resume_from_checkpoint="/content/drive/MyDrive/Colab Notebooks/wook/fine-tuning/datasets/qlora/qlora-out/checkpoint-4000")
 
     # Save adapter + processor/tokenizer
     adapter_dir = os.path.join(out_dir, "adapter")
