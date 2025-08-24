@@ -365,18 +365,20 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
                       bias="none", task_type="CAUSAL_LM")
 
 def find_linear_modules_in_vision(model):
-    """Vision 관련 Linear 모듈 자동 찾기"""
+    """Vision Projector의 Linear 모듈만 찾기 (Backbone 제외)"""
     linear_modules = []
     
     for name, module in model.named_modules():
-        # vision/visual 관련 모듈 중 Linear 타입만
-        if ('visual' in name.lower() or 'vision' in name.lower()):
-            if isinstance(module, (torch.nn.Linear, )):  # Linear4bit도 포함
-                # merger 또는 proj 관련만 (backbone 제외)
-                if any(key in name.lower() for key in ['merger', 'proj', 'projector']):
+        if ('visual' in name.lower()):
+            # ⚠️ blocks는 제외! (Vision Backbone)
+            if 'blocks' in name.lower():
+                continue  # Skip vision backbone
+                
+            # merger나 proj 관련만 포함
+            if any(key in name.lower() for key in ['merger', 'proj', 'projector']):
+                if isinstance(module, (torch.nn.Linear,)):
                     linear_modules.append(name)
-                    print(f"Found vision linear module: {name}")
-    
+                    print(f"Found projector module: {name}")
     return linear_modules
 
 def make_lora_config_with_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
