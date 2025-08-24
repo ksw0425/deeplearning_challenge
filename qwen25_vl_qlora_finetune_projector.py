@@ -464,7 +464,7 @@ def train(
                 print(f"  {name}: {type(module).__name__}")
         
         # 자동으로 적절한 모듈 찾기
-        lora_cfg = make_lora_config_with_projector_auto(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+        lora_cfg = make_lora_config_with_projector(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     else:
         print("[INFO] Configuring LoRA for LLM only")
         lora_cfg = make_lora_config(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
