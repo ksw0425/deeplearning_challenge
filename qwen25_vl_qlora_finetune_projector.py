@@ -374,9 +374,9 @@ def make_lora_config_with_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig
         # Vision-Language Projector (Qwen2-VL 기준)
         "visual.merger.mlp.0",  # Linear4bit 레이어
         "visual.merger.mlp.2",  # Linear4bit 레이어
-        ".*visual.*Linear.*",  # visual 관련 모든 Linear 레이어
     ]
-    
+    print(f"[INFO] LoRA target modules: {target_modules}")
+
     return LoraConfig(
         r=r, 
         lora_alpha=alpha, 
