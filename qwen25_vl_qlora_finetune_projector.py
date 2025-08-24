@@ -496,11 +496,16 @@ def train(
     need = {"task","input_type","input","question","output"}
     if not need.issubset(set(train_df.columns)):
         raise ValueError(f"Train file missing columns: {need - set(train_df.columns)}")
-    if valid_df is not None and not need.issubset(set(valid_df.columns)):
+    if valid_df is not None and not valid_df.empty and not need.issubset(set(valid_df.columns)):
         raise ValueError(f"Valid file missing columns: {need - set(valid_df.columns)}")
+    print(f"\n[DATA] Train samples: {len(train_df):,}")
+    if valid_df is not None and not valid_df.empty:
+        print(f"[DATA] Valid samples: {len(valid_df):,}")
     # 수정: 데이터셋 생성 (AugmentedMMDataset 사용)
     train_ds = AugmentedMMDataset(train_df, processor, augment=use_augmentation)
-    eval_ds  = AugmentedMMDataset(valid_df, processor, augment=False) if valid_df else None
+    eval_ds = None
+    if valid_df is not None and not valid_df.empty:
+        eval_ds = AugmentedMMDataset(valid_df, processor, augment=False)
     collator = QwenVLDataCollator(pad_token_id=tokenizer.pad_token_id)
 
     profiles = {
@@ -538,13 +543,13 @@ def train(
         if k in sig.parameters and v is not None:
             ta[k] = v
 
-    eval_strategy = "steps" if eval_ds is not None else "no"
-    maybe_set("evaluation_strategy", eval_strategy)  # older API
-    maybe_set("eval_strategy", eval_strategy)        # newer API (some 4.5x branches)
-    maybe_set("load_best_model_at_end", bool(eval_ds))
-    maybe_set("metric_for_best_model", "eval_loss" if eval_ds is not None else None)
-    maybe_set("greater_is_better", False if eval_ds is not None else None)
-
+    eval_strategy = "steps" if (valid_df is not None and not valid_df.empty) else "no"
+    maybe_set("evaluation_strategy", eval_strategy)
+    maybe_set("eval_strategy", eval_strategy)
+    maybe_set("load_best_model_at_end", bool(valid_df is not None and not valid_df.empty))
+    maybe_set("metric_for_best_model", "eval_loss" if (valid_df is not None and not valid_df.empty) else None)
+    maybe_set("greater_is_better", False if (valid_df is not None and not valid_df.empty) else None)
+    
     train_args = TrainingArguments(**ta)
     
     # 디버깅: TrainingArguments 객체에서 실제 값 확인
