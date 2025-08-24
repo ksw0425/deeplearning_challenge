@@ -372,11 +372,9 @@ def make_lora_config_with_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig
         "up_proj", "down_proj", "gate_proj",
         
         # Vision-Language Projector (Qwen2-VL 기준)
-        # 실제 모듈 이름은 모델 로드 후 확인 필요
-        "visual.merger",  # Vision tokens merger
-        "visual.proj",    # Vision-to-language projection
-        "model.visual.merger",
-        "model.visual.proj",
+        "visual.merger.mlp.0",  # Linear4bit 레이어
+        "visual.merger.mlp.2",  # Linear4bit 레이어
+        ".*visual.*Linear.*",  # visual 관련 모든 Linear 레이어
     ]
     
     return LoraConfig(
@@ -458,11 +456,19 @@ def train(
     # LoRA 설정 선택
     if train_projector:
         print("[INFO] Configuring LoRA for Vision-Language Projector + LLM")
-        lora_cfg = make_lora_config_with_projector(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+        
+        # 모델 구조 확인 (디버깅용)
+        print("\n[DEBUG] Checking model structure for vision modules...")
+        for name, module in model.named_modules():
+            if 'visual' in name.lower() and 'merger' in name.lower():
+                print(f"  {name}: {type(module).__name__}")
+        
+        # 자동으로 적절한 모듈 찾기
+        lora_cfg = make_lora_config_with_projector_auto(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     else:
         print("[INFO] Configuring LoRA for LLM only")
         lora_cfg = make_lora_config(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
-      
+    
     model = get_peft_model(model, lora_cfg)
   
     # 학습 가능한 파라미터 확인
