@@ -364,19 +364,38 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
     return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
                       bias="none", task_type="CAUSAL_LM")
 
-def make_lora_config_with_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """Vision-Language Projector + LLM 학습 (Vision Backbone은 freeze)"""
-    target_modules = [
-        # LLM 부분
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "up_proj", "down_proj", "gate_proj",
-        
-        # Vision-Language Projector (Qwen2-VL 기준)
-        "visual.merger.mlp.0",  # Linear4bit 레이어
-        "visual.merger.mlp.2",  # Linear4bit 레이어
-    ]
-    print(f"[INFO] LoRA target modules: {target_modules}")
+def find_linear_modules_in_vision(model):
+    """Vision 관련 Linear 모듈 자동 찾기"""
+    linear_modules = []
+    
+    for name, module in model.named_modules():
+        # vision/visual 관련 모듈 중 Linear 타입만
+        if ('visual' in name.lower() or 'vision' in name.lower()):
+            if isinstance(module, (torch.nn.Linear, )):  # Linear4bit도 포함
+                # merger 또는 proj 관련만 (backbone 제외)
+                if any(key in name.lower() for key in ['merger', 'proj', 'projector']):
+                    linear_modules.append(name)
+                    print(f"Found vision linear module: {name}")
+    
+    return linear_modules
 
+def make_lora_config_with_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
+    """모델에서 자동으로 Vision Projector 모듈 찾기"""
+    
+    # LLM 기본 모듈
+    base_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                   "up_proj", "down_proj", "gate_proj"]
+    
+    # Vision Linear 모듈 자동 탐색
+    vision_modules = find_linear_modules_in_vision(model)
+    
+    # 합치기
+    target_modules = base_modules + vision_modules
+    
+    print(f"\n[INFO] Total LoRA target modules: {len(target_modules)}")
+    print(f"  - LLM modules: {len(base_modules)}")
+    print(f"  - Vision modules: {len(vision_modules)}")
+    
     return LoraConfig(
         r=r, 
         lora_alpha=alpha, 
