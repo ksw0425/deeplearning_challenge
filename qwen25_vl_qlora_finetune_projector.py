@@ -507,7 +507,7 @@ def train(
                      gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
                      logging_steps=50, eval_steps=100, save_steps=100,  weight_decay=0.0),
         "base": dict(num_train_epochs=10, per_device_train_batch_size=1, per_device_eval_batch_size=1,
-                     gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
+                     gradient_accumulation_steps=16, learning_rate=5e-4, warmup_ratio=0.05,
                      logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.0),
     }
     p = profiles.get(profile, profiles["base"])
