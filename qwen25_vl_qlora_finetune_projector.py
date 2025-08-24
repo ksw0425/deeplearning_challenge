@@ -490,9 +490,6 @@ def train(
     
     model = get_peft_model(model, lora_cfg)
   
-    # 학습 가능한 파라미터 확인
-    print_trainable_modules(model)
-  
     # Data
     train_df = read_any(train_path)
     valid_df = read_any(valid_path) if valid_path else None
