@@ -364,45 +364,42 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
     return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
                       bias="none", task_type="CAUSAL_LM")
 
-def find_linear_modules_in_vision(model):
-    """Vision Projector의 Linear 모듈만 찾기 (Backbone 제외)"""
-    linear_modules = []
+def find_projector_modules(model):
+    """Vision-Language Projector 모듈만 찾기 (LLM 제외)"""
+    projector_modules = []
     
     for name, module in model.named_modules():
-        if ('visual' in name.lower()):
-            # ⚠️ blocks는 제외! (Vision Backbone)
-            if 'blocks' in name.lower():
-                continue  # Skip vision backbone
-                
-            # merger나 proj 관련만 포함
-            if any(key in name.lower() for key in ['merger', 'proj', 'projector']):
-                if isinstance(module, (torch.nn.Linear,)):
-                    linear_modules.append(name)
-                    print(f"Found projector module: {name}")
-    return linear_modules
+        # visual.merger 관련 Linear 레이어만
+        if 'visual' in name.lower() and 'merger' in name.lower():
+            if isinstance(module, (torch.nn.Linear,)):
+                projector_modules.append(name)
+                print(f"Found projector module: {name}")
+    
+    return projector_modules
 
-def make_lora_config_with_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """모델에서 자동으로 Vision Projector 모듈 찾기"""
+def make_lora_config_projector_only(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
+    """Projector만 학습 (LLM 제외)"""
     
-    # LLM 기본 모듈
-    base_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                   "up_proj", "down_proj", "gate_proj"]
+    # Projector 모듈만 찾기
+    projector_modules = find_projector_modules(model)
     
-    # Vision Linear 모듈 자동 탐색
-    vision_modules = find_linear_modules_in_vision(model)
+    if not projector_modules:
+        print("[WARNING] No projector modules found!")
+        # fallback: 수동 지정
+        projector_modules = [
+            "model.visual.merger.mlp.0",
+            "model.visual.merger.mlp.2"
+        ]
     
-    # 합치기
-    target_modules = base_modules + vision_modules
-    
-    print(f"\n[INFO] Total LoRA target modules: {len(target_modules)}")
-    print(f"  - LLM modules: {len(base_modules)}")
-    print(f"  - Vision modules: {len(vision_modules)}")
+    print(f"\n[INFO] LoRA target modules (Projector only): {len(projector_modules)}")
+    for m in projector_modules:
+        print(f"  - {m}")
     
     return LoraConfig(
         r=r, 
         lora_alpha=alpha, 
         lora_dropout=dropout, 
-        target_modules=target_modules,
+        target_modules=projector_modules,  # Projector만!
         bias="none", 
         task_type="CAUSAL_LM"
     )
@@ -430,6 +427,7 @@ def train(
     lora_dropout: float = 0.05,
     # 새로 추가된 파라미터들
     train_projector: bool = False,  # Vision-Language Projector 학습 여부
+    train_mode: str = "projector",
     use_augmentation: bool = False,  # 이미지 증강 사용 여부
     max_steps: Optional[int] = None,  # 최대 학습 스텝
     resume_from_checkpoint: Optional[str] = None,  # 체크포인트 재개
@@ -474,20 +472,14 @@ def train(
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
   
-    # LoRA 설정 선택
-    if train_projector:
-        print("[INFO] Configuring LoRA for Vision-Language Projector + LLM")
-        
-        # 모델 구조 확인 (디버깅용)
-        print("\n[DEBUG] Checking model structure for vision modules...")
-        for name, module in model.named_modules():
-            if 'visual' in name.lower() and 'merger' in name.lower():
-                print(f"  {name}: {type(module).__name__}")
-        
-        # 자동으로 적절한 모듈 찾기
-        lora_cfg = make_lora_config_with_projector(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
-    else:
-        print("[INFO] Configuring LoRA for LLM only")
+    if train_mode == "projector":
+        print("[INFO] Configuring LoRA for Projector ONLY")
+        lora_cfg = make_lora_config_projector_only(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    elif train_mode == "both":
+        print("[INFO] Configuring LoRA for Projector + LLM")
+        lora_cfg = make_lora_config_with_projector_auto(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    else:  # "llm" (default)
+        print("[INFO] Configuring LoRA for LLM ONLY")
         lora_cfg = make_lora_config(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     
     model = get_peft_model(model, lora_cfg)
