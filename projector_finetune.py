@@ -420,7 +420,6 @@ def train(
     lora_alpha: int = 128,
     lora_dropout: float = 0.05,
     # 새로 추가된 파라미터들
-    train_projector: bool = False,  # Vision-Language Projector 학습 여부
     use_augmentation: bool = False,  # 이미지 증강 사용 여부
     max_steps: Optional[int] = None,  # 최대 학습 스텝
     resume_from_checkpoint: Optional[str] = None,  # 체크포인트 재개
