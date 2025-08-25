@@ -377,29 +377,25 @@ def find_projector_modules(model):
     
     return projector_modules
 
-def make_lora_config_projector_only(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """Projector만 학습 (LLM 제외)"""
+def make_lora_config_llm_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig:
+    """LLM + Projector 동시 학습 (Vision Backbone 제외)"""
     
-    # Projector 모듈만 찾기
-    projector_modules = find_projector_modules(model)
+    target_modules = [
+        # LLM 모듈
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "up_proj", "down_proj", "gate_proj",
+        
+        # Projector 모듈 (merger만)
+        "model.visual.merger.mlp.0",
+        "model.visual.merger.mlp.2",
+    ]
     
-    if not projector_modules:
-        print("[WARNING] No projector modules found!")
-        # fallback: 수동 지정
-        projector_modules = [
-            "model.visual.merger.mlp.0",
-            "model.visual.merger.mlp.2"
-        ]
-    
-    print(f"\n[INFO] LoRA target modules (Projector only): {len(projector_modules)}")
-    for m in projector_modules:
-        print(f"  - {m}")
-    
+    print(f"[INFO] LLM + Projector modules: {len(target_modules)}")
     return LoraConfig(
         r=r, 
         lora_alpha=alpha, 
         lora_dropout=dropout, 
-        target_modules=projector_modules,  # Projector만!
+        target_modules=target_modules,
         bias="none", 
         task_type="CAUSAL_LM"
     )
@@ -503,12 +499,16 @@ def train(
     collator = QwenVLDataCollator(pad_token_id=tokenizer.pad_token_id)
 
     profiles = {
-        "dev":  dict(max_steps=4400, per_device_train_batch_size=1, per_device_eval_batch_size=1,
-                     gradient_accumulation_steps=16, learning_rate=8e-5, warmup_ratio=0.05,
-                     logging_steps=50, eval_steps=100, save_steps=100,  weight_decay=0.0),
         "base": dict(num_train_epochs=10, per_device_train_batch_size=1, per_device_eval_batch_size=1,
-                     gradient_accumulation_steps=16, learning_rate=5e-4, warmup_ratio=0.05,
-                     logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.0),
+                     gradient_accumulation_steps=16, learning_rate=3e-5, warmup_steps=200,
+                     logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.1,
+                     max_grad_norm=1.0, load_best_model_at_end=True, metric_for_best_model="eval_loss", 
+                     greater_is_better=False)
+        "base": dict(num_train_epochs=10, per_device_train_batch_size=1, per_device_eval_batch_size=1,
+                     gradient_accumulation_steps=16, learning_rate=5e-5, warmup_steps=200,
+                     logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.1,
+                     max_grad_norm=1.0, load_best_model_at_end=True, metric_for_best_model="eval_loss", 
+                     greater_is_better=False)
     }
     p = profiles.get(profile, profiles["base"])
     
