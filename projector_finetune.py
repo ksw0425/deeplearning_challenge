@@ -364,30 +364,41 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
     return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
                       bias="none", task_type="CAUSAL_LM")
 
-def make_lora_config_llm_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """모델 구조를 확인하여 LLM + Projector만 선택"""
-    
-    target_modules = []
+def find_projector_modules(model):
+    """Vision Projector의 Linear 모듈만 찾기 (Backbone 제외)"""
+    projector_modules = []
     
     for name, module in model.named_modules():
-        # Vision Backbone 제외
-        if "visual.blocks" in name:
-            continue
-            
-        # LLM 레이어 선택
-        if any(x in name for x in ["q_proj", "k_proj", "v_proj", "o_proj", 
-                                   "up_proj", "down_proj", "gate_proj"]):
-            if "visual" not in name or "merger" in name:
-                target_modules.append(name)
+        if 'visual' in name.lower():
+            # blocks는 제외 (Vision Backbone)
+            if 'blocks' in name.lower():
+                continue
                 
-        # Projector 선택
-        if "visual.merger.mlp" in name:
-            target_modules.append(name)
+            # merger나 proj 관련만 포함
+            if any(key in name.lower() for key in ['merger', 'proj', 'projector']):
+                if isinstance(module, torch.nn.Linear):
+                    projector_modules.append(name)
+                    print(f"  Found projector: {name}")
     
-    print(f"[INFO] Selected modules for LoRA:")
-    for m in target_modules[:10]:  # 처음 10개만 출력
-        print(f"  - {m}")
-    print(f"  ... total {len(target_modules)} modules")
+    return projector_modules
+
+def make_lora_config_llm_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
+    """LLM + Projector만 학습 (Vision Backbone 제외)"""
+    
+    # LLM 기본 모듈 (단순 이름)
+    llm_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                   "up_proj", "down_proj", "gate_proj"]
+    
+    # Projector 모듈 찾기 (전체 경로)
+    projector_modules = find_projector_modules(model)
+    
+    # 합치기
+    target_modules = llm_modules + projector_modules
+    
+    print(f"\n[INFO] LoRA Configuration:")
+    print(f"  - LLM modules (pattern): {llm_modules}")
+    print(f"  - Projector modules (exact): {len(projector_modules)} found")
+    print(f"  - Total targets: {len(target_modules)}")
     
     return LoraConfig(
         r=r,
@@ -464,7 +475,7 @@ def train(
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
   
     print("\n[INFO] Configuring LoRA for LLM + Projector (Vision Backbone FROZEN)")
-    lora_cfg = make_lora_config_llm_projector(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    lora_cfg = make_lora_config_llm_projector(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     model = get_peft_model(model, lora_cfg)
     # 확인
     print("\n[INFO] Verifying trainable parameters:")
