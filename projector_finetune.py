@@ -421,7 +421,6 @@ def train(
     lora_dropout: float = 0.05,
     # 새로 추가된 파라미터들
     train_projector: bool = False,  # Vision-Language Projector 학습 여부
-    train_mode: str = "llm_projector",
     use_augmentation: bool = False,  # 이미지 증강 사용 여부
     max_steps: Optional[int] = None,  # 최대 학습 스텝
     resume_from_checkpoint: Optional[str] = None,  # 체크포인트 재개
@@ -506,7 +505,7 @@ def train(
     profiles = {
         "dev": dict(num_train_epochs=10, per_device_train_batch_size=1, per_device_eval_batch_size=1,
                      gradient_accumulation_steps=16, learning_rate=3e-5, warmup_steps=200,
-                     logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.1,
+                     logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.01,
                      max_grad_norm=1.0, load_best_model_at_end=True, metric_for_best_model="eval_loss", 
                      greater_is_better=False),
         "base": dict(num_train_epochs=10, per_device_train_batch_size=1, per_device_eval_batch_size=1,
@@ -573,22 +572,33 @@ def train(
         init_kwargs["tokenizer"] = tokenizer
 
     trainer = Trainer(**init_kwargs)
-    # 체크포인트에서 재개
-    if resume_from_checkpoint:
-        print(f"\n[INFO] Resuming from checkpoint: {resume_from_checkpoint}")
+    # 초기 validation loss 확인
+    if eval_ds is not None:
+        initial_eval = trainer.evaluate()
+        print(f"\n[INITIAL] Validation Loss: {initial_eval['eval_loss']:.4f}")
         
-        # trainer_state.json 수정 체크
-        if isinstance(resume_from_checkpoint, str) and os.path.exists(resume_from_checkpoint):
-            state_path = os.path.join(resume_from_checkpoint, "trainer_state.json")
-            if os.path.exists(state_path):
-                with open(state_path, 'r') as f:
-                    state = json.load(f)
-                if state.get('eval_steps') != train_args.eval_steps or state.get('save_steps') != train_args.save_steps:
-                    print(f"[WARNING] Updating trainer_state.json with new eval/save steps")
-                    state['eval_steps'] = train_args.eval_steps
-                    state['save_steps'] = train_args.save_steps
-                    with open(state_path, 'w') as f:
-                        json.dump(state, f, indent=2)
+        # Loss가 너무 높으면 경고
+        if initial_eval['eval_loss'] > 2.0:
+            print("⚠️ WARNING: Initial validation loss is very high!")
+            response = input("Continue? (y/n): ")
+            if response.lower() != 'y':
+                print("Training aborted.")
+                return None
+                
+    if resume_from_checkpoint:
+        # 이전 체크포인트가 LLM만 학습했는지 확인
+        adapter_config_path = os.path.join(resume_from_checkpoint, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            with open(adapter_config_path, 'r') as f:
+                config = json.load(f)
+                old_modules = set(config.get('target_modules', []))
+                new_modules = set(lora_cfg.target_modules)
+                
+                if old_modules != new_modules:
+                    print(f"⚠️ WARNING: Module mismatch!")
+                    print(f"  Old: {old_modules}")
+                    print(f"  New: {new_modules}")
+                    print("This may cause issues!")
         
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     else:
