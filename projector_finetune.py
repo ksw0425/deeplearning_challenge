@@ -364,20 +364,30 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
     return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
                       bias="none", task_type="CAUSAL_LM")
 
-def make_lora_config_llm_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """LLM + Projector만 학습 (Vision Backbone 제외)"""
+def make_lora_config_llm_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
+    """모델 구조를 확인하여 LLM + Projector만 선택"""
     
-    target_modules = [
-        # LLM
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "up_proj", "down_proj", "gate_proj",
-        
-        # Projector
-        "model.visual.merger.mlp.0",
-        "model.visual.merger.mlp.2",
-    ]
+    target_modules = []
     
-    print(f"[INFO] Target modules: {len(target_modules)}")
+    for name, module in model.named_modules():
+        # Vision Backbone 제외
+        if "visual.blocks" in name:
+            continue
+            
+        # LLM 레이어 선택
+        if any(x in name for x in ["q_proj", "k_proj", "v_proj", "o_proj", 
+                                   "up_proj", "down_proj", "gate_proj"]):
+            if "visual" not in name or "merger" in name:
+                target_modules.append(name)
+                
+        # Projector 선택
+        if "visual.merger.mlp" in name:
+            target_modules.append(name)
+    
+    print(f"[INFO] Selected modules for LoRA:")
+    for m in target_modules[:10]:  # 처음 10개만 출력
+        print(f"  - {m}")
+    print(f"  ... total {len(target_modules)} modules")
     
     return LoraConfig(
         r=r,
@@ -386,7 +396,6 @@ def make_lora_config_llm_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig:
         target_modules=target_modules,
         bias="none",
         task_type="CAUSAL_LM",
-        modules_to_save=None,
     )
   
 # ========= Utilities =========
