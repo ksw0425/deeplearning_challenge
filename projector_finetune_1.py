@@ -537,9 +537,6 @@ def train(
     print(f"  - eval_strategy: {getattr(train_args, 'eval_strategy', 'NOT SET')}")
     print(f"  - logging_steps: {train_args.logging_steps}\n")
     
-    # 학습 시작 전 최종 확인
-    input("Press Enter to continue with training...")  # 수동 확인용
-    
     init_kwargs = dict(
         model=model, args=train_args,
         train_dataset=train_ds, eval_dataset=eval_ds,
@@ -553,19 +550,17 @@ def train(
 
     trainer = Trainer(**init_kwargs)
     
-    # 초기 validation loss 확인
+    # 초기 validation loss 확인 (경고만, 중단 없음)
     if eval_ds is not None:
         initial_eval = trainer.evaluate()
-        print(f"\n[INITIAL] Validation Loss: {initial_eval['eval_loss']:.4f}")
-        
-        # Loss가 너무 높으면 경고
-        if initial_eval['eval_loss'] > 2.0:
-            print("⚠️ WARNING: Initial validation loss is very high!")
-            response = input("Continue? (y/n): ")
-            if response.lower() != 'y':
-                print("Training aborted.")
-                return None
-                
+        loss = float(initial_eval.get("eval_loss", float("nan")))
+        if not (loss == loss):  # NaN 체크
+            print("\n[INITIAL] Validation Loss: N/A (eval_loss not found)")
+        else:
+            print(f"\n[INITIAL] Validation Loss: {loss:.4f}")
+            if loss > 2.0:
+                print("⚠️ WARNING: Initial validation loss is very high! (continuing anyway)")
+      
     if resume_from_checkpoint:
         print(f"\n[INFO] Resuming from checkpoint: {resume_from_checkpoint}")
         
