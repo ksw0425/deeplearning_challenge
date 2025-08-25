@@ -468,15 +468,8 @@ def train(
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
   
-    if train_mode == "projector":
-        print("[INFO] Configuring LoRA for Projector ONLY")
-        lora_cfg = make_lora_config_projector_only(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
-    elif train_mode == "both":
-        print("[INFO] Configuring LoRA for Projector + LLM")
-        lora_cfg = make_lora_config_with_projector_auto(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
-    else:  # "llm" (default)
-        print("[INFO] Configuring LoRA for LLM ONLY")
-        lora_cfg = make_lora_config(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    print("[INFO] Configuring LoRA for Projector + LLM")
+    lora_cfg = make_lora_config_llm_projector(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     
     model = get_peft_model(model, lora_cfg)
   
