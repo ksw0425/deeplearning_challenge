@@ -431,7 +431,6 @@ def train(
     print(f"[CONFIG] Training Configuration")
     print(f"{'='*60}")
     print(f"Profile: {profile}")
-    print(f"Train Projector: {train_projector}")
     print(f"Use Augmentation: {use_augmentation}")
     print(f"Max Steps: {max_steps if max_steps else 'Not set (use epochs)'}")
     print(f"Resume from: {resume_from_checkpoint if resume_from_checkpoint else 'Fresh start'}")
@@ -626,7 +625,6 @@ def build_parser():
     p.add_argument("--lora_alpha", type=int, default=128)
     p.add_argument("--lora_dropout", type=float, default=0.05)
       # 새로 추가된 arguments
-    p.add_argument("--train_projector", action="store_true", help="Train vision-language projector")
     p.add_argument("--use_augmentation", action="store_true", help="Use image augmentation")
     p.add_argument("--max_steps", type=int, default=None, help="Maximum training steps")
     p.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from checkpoint")
@@ -643,7 +641,6 @@ def main():
         lora_r=args.lora_r, 
         lora_alpha=args.lora_alpha, 
         lora_dropout=args.lora_dropout,
-        train_projector=args.train_projector,
         use_augmentation=args.use_augmentation,
         max_steps=args.max_steps,
         resume_from_checkpoint=args.resume_from_checkpoint,
