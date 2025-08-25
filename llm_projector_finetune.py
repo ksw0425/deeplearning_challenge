@@ -1,6 +1,6 @@
-# qwen25_vl_adapter_finetune/trainer.py
+# qwen25_vl_efficient_lora_finetune/trainer.py
 # transformers==4.55.2, bitsandbytes==0.47.0
-# Qwen2.5-VL-7B — Unified Multitask Fine-tuning (Adapter)
+# Qwen2.5-VL-7B — Unified Multitask Fine-tuning (Efficient LoRA)
 import os, io, re, csv, json, base64, hashlib, warnings, argparse, inspect, random
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
@@ -19,7 +19,7 @@ from transformers import (
     BitsAndBytesConfig, Trainer, TrainingArguments,
 )
 
-from peft import AdapterConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 # ========= Safety / Env =========
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb=128")
@@ -278,7 +278,7 @@ class QwenVLDataCollator:
 
         return batch
 
-# ========= Adapter config =========
+# ========= QLoRA config (Efficient) =========
 def make_bnb_config() -> BitsAndBytesConfig:
     return BitsAndBytesConfig(
         load_in_4bit=True,
@@ -287,65 +287,68 @@ def make_bnb_config() -> BitsAndBytesConfig:
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-def make_adapter_config(reduction_factor=16, adapter_dropout=0.1) -> AdapterConfig:
-    """Standard Adapter configuration"""
-    return AdapterConfig(
-        reduction_factor=reduction_factor,  # Hidden dimension = input_dim / reduction_factor
-        non_linearity="relu",  # Activation function
-        adapter_dropout=adapter_dropout,
-        target_modules=["q_proj", "v_proj"],  # Where to insert adapters
-        scaling=1.0,  # Scaling factor for adapter output
-    )
-
-def make_adapter_config_with_projector(model, reduction_factor=16, adapter_dropout=0.1) -> AdapterConfig:
-    """Adapter configuration for LLM + Vision Projector"""
+def make_efficient_lora_config(model, r=16, alpha=32, dropout=0.05) -> LoraConfig:
+    """효율적인 LoRA 설정 - Adapter와 유사한 파라미터 수준"""
     
-    # Adapter를 삽입할 모듈 찾기
     target_modules = []
     
+    # 모든 Linear 모듈의 전체 경로 수집
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
-            # Vision Backbone 제외
+            # Vision Backbone (blocks) 제외
             if 'visual.blocks' in name:
-                continue
+                continue  # Skip vision backbone entirely
             
-            # LLM attention layers (q_proj, v_proj만 사용 - Adapter 관례)
+            # LLM 레이어 - q_proj, v_proj만 (Adapter처럼 효율적으로)
             if 'visual' not in name:
-                if any(x in name for x in ['q_proj', 'v_proj']):
-                    # 전체 경로 추가
+                if any(x in name for x in ['q_proj', 'v_proj']):  # k_proj, o_proj 제외하여 파라미터 감소
                     target_modules.append(name)
             
-            # Vision Projector layers
+            # Vision Projector (merger) 레이어
             elif 'visual.merger' in name:
                 target_modules.append(name)
     
-    print(f"\n[INFO] Selected {len(target_modules)} modules for Adapters")
+    print(f"\n[INFO] Efficient LoRA Configuration")
+    print(f"[INFO] Selected {len(target_modules)} modules for LoRA")
     print("[INFO] Module distribution:")
     
     # 모듈 분포 확인
     llm_count = sum(1 for m in target_modules if 'visual' not in m)
     projector_count = sum(1 for m in target_modules if 'visual.merger' in m)
     
-    print(f"  - LLM modules: {llm_count}")
+    print(f"  - LLM modules (q_proj, v_proj only): {llm_count}")
     print(f"  - Projector modules: {projector_count}")
+    print(f"  - LoRA rank: {r} (lower rank for efficiency)")
+    print(f"  - LoRA alpha: {alpha}")
     
-    # Vision backbone 체크
+    # Vision backbone이 포함되었는지 확인
     backbone_modules = [m for m in target_modules if 'visual.blocks' in m]
     if backbone_modules:
         print(f"\n⚠️ ERROR: {len(backbone_modules)} backbone modules incorrectly included!")
+        for m in backbone_modules[:5]:
+            print(f"    - {m}")
     else:
         print("  ✓ Vision Backbone successfully excluded")
     
+    # 샘플 모듈 출력
     print("\n[INFO] Sample target modules:")
     for m in target_modules[:5]:
         print(f"  - {m}")
+    if len(target_modules) > 10:
+        print(f"  ... and {len(target_modules) - 5} more")
     
-    return AdapterConfig(
-        reduction_factor=reduction_factor,
-        non_linearity="relu",
-        adapter_dropout=adapter_dropout,
+    # 예상 파라미터 수 계산
+    trainable_params = len(target_modules) * r * 768 * 2  # 대략적인 계산
+    print(f"\n[INFO] Estimated trainable parameters: ~{trainable_params/1e6:.1f}M")
+    
+    return LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
         target_modules=target_modules,
-        scaling=1.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+        modules_to_save=None,
     )
 
 def fix_trainer_state_json(checkpoint_path: str):
@@ -399,8 +402,9 @@ def train(
     valid_path: Optional[str],
     out_dir: str,
     profile: str = "base",          # "dev" | "base" | "long"
-    reduction_factor: int = 16,     # Adapter hidden dimension factor
-    adapter_dropout: float = 0.1,   # Adapter dropout
+    lora_r: int = 16,               # 낮은 rank로 효율성 증대
+    lora_alpha: int = 32,           # Alpha = 2 * r
+    lora_dropout: float = 0.05,
     # 추가 파라미터들
     max_steps: Optional[int] = None,  # 최대 학습 스텝
     resume_from_checkpoint: Optional[str] = None,  # 체크포인트 재개
@@ -409,11 +413,12 @@ def train(
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"[CONFIG] Training Configuration")
+    print(f"[CONFIG] Efficient LoRA Training Configuration")
     print(f"{'='*60}")
     print(f"Profile: {profile}")
-    print(f"Adapter Reduction Factor: {reduction_factor}")
-    print(f"Adapter Dropout: {adapter_dropout}")
+    print(f"LoRA Rank: {lora_r} (efficient setting)")
+    print(f"LoRA Alpha: {lora_alpha}")
+    print(f"LoRA Dropout: {lora_dropout}")
     print(f"Max Steps: {max_steps if max_steps else 'Not set (use epochs)'}")
     print(f"Resume from: {resume_from_checkpoint if resume_from_checkpoint else 'Fresh start'}")
     print(f"{'='*60}\n")
@@ -445,9 +450,9 @@ def train(
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
   
-    print("\n[INFO] Configuring Adapters for LLM + Projector (Vision Backbone FROZEN)")
-    adapter_cfg = make_adapter_config_with_projector(model, reduction_factor=reduction_factor, adapter_dropout=adapter_dropout)
-    model = get_peft_model(model, adapter_cfg)
+    print("\n[INFO] Configuring Efficient LoRA for LLM + Projector (Vision Backbone FROZEN)")
+    lora_cfg = make_efficient_lora_config(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    model = get_peft_model(model, lora_cfg)
     
     # 확인
     print("\n[INFO] Verifying trainable parameters:")
@@ -573,13 +578,13 @@ def train(
             with open(adapter_config_path, 'r') as f:
                 config = json.load(f)
                 old_modules = set(config.get('target_modules', []))
-                new_modules = set(adapter_cfg.target_modules)
+                new_modules = set(lora_cfg.target_modules)
                 
                 if old_modules != new_modules:
                     print(f"\n⚠️ WARNING: Module configuration mismatch detected!")
                     print(f"  Old modules: {sorted(old_modules)}")
                     print(f"  New modules: {sorted(new_modules)}")
-                    print("\nThis is expected if switching from LoRA to Adapter or changing target modules.")
+                    print("\nThis is expected if changing LoRA configuration.")
                     print("The training will continue with the new configuration.\n")
         
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
@@ -599,14 +604,15 @@ def train(
 
 # ========= CLI (optional) =========
 def build_parser():
-    p = argparse.ArgumentParser(description="Qwen2.5-VL-7B unified multitask fine-tuning (Adapter)")
+    p = argparse.ArgumentParser(description="Qwen2.5-VL-7B unified multitask fine-tuning (Efficient LoRA)")
     p.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--train_path", type=str, required=True)
     p.add_argument("--valid_path", type=str, default=None)
     p.add_argument("--out_dir",   type=str, required=True)
     p.add_argument("--profile",   choices=["dev","base","long"], default="base")
-    p.add_argument("--reduction_factor", type=int, default=16, help="Adapter reduction factor")
-    p.add_argument("--adapter_dropout", type=float, default=0.1, help="Adapter dropout")
+    p.add_argument("--lora_r", type=int, default=16, help="LoRA rank (lower = more efficient)")
+    p.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    p.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
     # 추가 arguments
     p.add_argument("--max_steps", type=int, default=None, help="Maximum training steps")
     p.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from checkpoint")
@@ -620,8 +626,9 @@ def main():
         valid_path=args.valid_path,
         out_dir=args.out_dir,
         profile=args.profile,
-        reduction_factor=args.reduction_factor,
-        adapter_dropout=args.adapter_dropout,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         max_steps=args.max_steps,
         resume_from_checkpoint=args.resume_from_checkpoint,
     )
