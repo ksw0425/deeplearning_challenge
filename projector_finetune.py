@@ -364,7 +364,7 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
     return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
                       bias="none", task_type="CAUSAL_LM")
 
-def make_lora_config_llm_projector_safe(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
+def make_lora_config_llm_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
     """LLM + Projector만 학습 (Vision Backbone 확실히 제외)"""
     
     target_modules = []
