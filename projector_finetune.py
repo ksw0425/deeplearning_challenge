@@ -503,7 +503,7 @@ def train(
                      gradient_accumulation_steps=16, learning_rate=3e-5, warmup_steps=200,
                      logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.1,
                      max_grad_norm=1.0, load_best_model_at_end=True, metric_for_best_model="eval_loss", 
-                     greater_is_better=False)
+                     greater_is_better=False),
         "base": dict(num_train_epochs=10, per_device_train_batch_size=1, per_device_eval_batch_size=1,
                      gradient_accumulation_steps=16, learning_rate=5e-5, warmup_steps=200,
                      logging_steps=50, eval_steps=500, save_steps=500,  weight_decay=0.1,
