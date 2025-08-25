@@ -1,6 +1,6 @@
-# qwen25_vl_qlora_finetune/trainer.py
+# qwen25_vl_adapter_finetune/trainer.py
 # transformers==4.55.2, bitsandbytes==0.47.0
-# Qwen2.5-VL-7B — Unified Multitask Fine-tuning (QLoRA)
+# Qwen2.5-VL-7B — Unified Multitask Fine-tuning (Adapter)
 import os, io, re, csv, json, base64, hashlib, warnings, argparse, inspect, random
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Tuple
@@ -10,7 +10,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from PIL import Image, ImageFile, ImageEnhance
+from PIL import Image, ImageFile
 from torchvision import transforms
 
 from transformers import (
@@ -19,7 +19,7 @@ from transformers import (
     BitsAndBytesConfig, Trainer, TrainingArguments,
 )
 
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import AdapterConfig, get_peft_model, prepare_model_for_kbit_training
 
 # ========= Safety / Env =========
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb=128")
@@ -159,81 +159,12 @@ def build_messages(inp_type: str, task: str, inp: str, question: str, output: Op
         msgs.append({"role": "assistant", "content": [{"type": "text", "text": str(output).rstrip()}]})
     return msgs, images
 
-# ========= Image Augmentation =========
-class ImageAugmentor:
-    """이미지 증강 클래스"""
-    def __init__(self, 
-                 brightness=0.2, 
-                 contrast=0.2, 
-                 saturation=0.2, 
-                 hue=0.1,
-                 rotation_degree=10,
-                 crop_scale=(0.9, 1.0)):
-        
-        self.color_jitter = transforms.ColorJitter(
-            brightness=brightness,
-            contrast=contrast,
-            saturation=saturation,
-            hue=hue
-        )
-        self.rotation_degree = rotation_degree
-        self.crop_scale = crop_scale
-    
-    def augment(self, img: Image.Image, task: str) -> Image.Image:
-        """태스크별 차별화된 증강 적용"""
-        
-        # VQA나 문서 관련 태스크는 증강 최소화
-        if any(keyword in task.lower() for keyword in ['vqa', 'question', 'document', 'ocr', 'text']):
-            # 약한 color jitter만 적용
-            if random.random() > 0.7:
-                img = self.color_jitter(img)
-            return img
-        
-        # Captioning 등 일반 이미지 태스크는 강한 증강
-        # 1. 랜덤 회전
-        if random.random() > 0.5:
-            angle = random.uniform(-self.rotation_degree, self.rotation_degree)
-            img = img.rotate(angle, fillcolor=(255, 255, 255))
-        
-        # 2. 랜덤 수평 플립
-        if random.random() > 0.5:
-            img = img.transpose(Image.FLIP_LEFT_RIGHT)
-        
-        # 3. Color Jitter
-        if random.random() > 0.3:
-            img = self.color_jitter(img)
-        
-        # 4. 랜덤 크롭 & 리사이즈
-        if random.random() > 0.5:
-            w, h = img.size
-            crop_ratio = random.uniform(*self.crop_scale)
-            new_w = int(w * crop_ratio)
-            new_h = int(h * crop_ratio)
-            
-            left = random.randint(0, max(0, w - new_w))
-            top = random.randint(0, max(0, h - new_h))
-            img = img.crop((left, top, left + new_w, top + new_h))
-            img = img.resize((w, h), Image.LANCZOS)
-        
-        # 5. 추가 밝기/대비 조정
-        if random.random() > 0.5:
-            enhancer = ImageEnhance.Brightness(img)
-            img = enhancer.enhance(random.uniform(0.8, 1.2))
-        
-        if random.random() > 0.5:
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(random.uniform(0.8, 1.2))
-        
-        return img
-      
 # ========= Dataset & Collator =========
-class AugmentedMMDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, processor: AutoProcessor, augment: bool = False):
+class MMDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, processor: AutoProcessor):
         self.df = df.reset_index(drop=True)
         self.p = processor
         self.max_len = getattr(self.p.tokenizer, "model_max_length", 4096)
-        self.augment = augment
-        self.augmentor = ImageAugmentor() if augment else None
 
     def __len__(self): 
         return len(self.df)
@@ -246,12 +177,10 @@ class AugmentedMMDataset(Dataset):
         q        = row.get("question", "") or ""
         out      = str(row.get("output", "")).rstrip()
 
-        # 이미지 처리 및 증강
+        # 이미지 처리
         img_obj = None
         if inp_type == "image":
             img_obj = load_image_strict(inp)
-            if self.augment and self.augmentor:
-                img_obj = self.augmentor.augment(img_obj, task)
 
         msgs_prompt, images = build_messages(inp_type, task, inp, q, output=None, img_obj=img_obj)
         msgs_full,   _      = build_messages(inp_type, task, inp, q, output=out, img_obj=img_obj)
@@ -349,7 +278,7 @@ class QwenVLDataCollator:
 
         return batch
 
-# ========= QLoRA config =========
+# ========= Adapter config =========
 def make_bnb_config() -> BitsAndBytesConfig:
     return BitsAndBytesConfig(
         load_in_4bit=True,
@@ -358,36 +287,39 @@ def make_bnb_config() -> BitsAndBytesConfig:
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[List[str]] = None) -> LoraConfig:
-    if target_modules is None:
-        target_modules = ["q_proj","k_proj","v_proj","o_proj","up_proj","down_proj","gate_proj"]
-    return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
-                      bias="none", task_type="CAUSAL_LM")
+def make_adapter_config(reduction_factor=16, adapter_dropout=0.1) -> AdapterConfig:
+    """Standard Adapter configuration"""
+    return AdapterConfig(
+        reduction_factor=reduction_factor,  # Hidden dimension = input_dim / reduction_factor
+        non_linearity="relu",  # Activation function
+        adapter_dropout=adapter_dropout,
+        target_modules=["q_proj", "v_proj"],  # Where to insert adapters
+        scaling=1.0,  # Scaling factor for adapter output
+    )
 
-def make_lora_config_llm_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """LLM + Projector만 학습 (Vision Backbone 확실히 제외)"""
+def make_adapter_config_with_projector(model, reduction_factor=16, adapter_dropout=0.1) -> AdapterConfig:
+    """Adapter configuration for LLM + Vision Projector"""
     
+    # Adapter를 삽입할 모듈 찾기
     target_modules = []
     
-    # 모든 Linear 모듈의 전체 경로 수집
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
-            # Vision Backbone (blocks) 제외
+            # Vision Backbone 제외
             if 'visual.blocks' in name:
-                continue  # Skip vision backbone entirely
+                continue
             
-            # LLM 레이어 (visual이 없는 경로)
+            # LLM attention layers (q_proj, v_proj만 사용 - Adapter 관례)
             if 'visual' not in name:
-                # LLM의 attention/mlp 레이어
-                if any(x in name for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 
-                                           'up_proj', 'down_proj', 'gate_proj']):
+                if any(x in name for x in ['q_proj', 'v_proj']):
+                    # 전체 경로 추가
                     target_modules.append(name)
             
-            # Vision Projector (merger) 레이어
+            # Vision Projector layers
             elif 'visual.merger' in name:
                 target_modules.append(name)
     
-    print(f"\n[INFO] Selected {len(target_modules)} modules for LoRA")
+    print(f"\n[INFO] Selected {len(target_modules)} modules for Adapters")
     print("[INFO] Module distribution:")
     
     # 모듈 분포 확인
@@ -397,30 +329,23 @@ def make_lora_config_llm_projector(model, r=64, alpha=128, dropout=0.05) -> Lora
     print(f"  - LLM modules: {llm_count}")
     print(f"  - Projector modules: {projector_count}")
     
-    # Vision backbone이 포함되었는지 확인
+    # Vision backbone 체크
     backbone_modules = [m for m in target_modules if 'visual.blocks' in m]
     if backbone_modules:
         print(f"\n⚠️ ERROR: {len(backbone_modules)} backbone modules incorrectly included!")
-        for m in backbone_modules[:5]:
-            print(f"    - {m}")
     else:
         print("  ✓ Vision Backbone successfully excluded")
     
-    # 샘플 모듈 출력
     print("\n[INFO] Sample target modules:")
     for m in target_modules[:5]:
         print(f"  - {m}")
-    if len(target_modules) > 10:
-        print(f"  ... and {len(target_modules) - 5} more")
     
-    return LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        lora_dropout=dropout,
+    return AdapterConfig(
+        reduction_factor=reduction_factor,
+        non_linearity="relu",
+        adapter_dropout=adapter_dropout,
         target_modules=target_modules,
-        bias="none",
-        task_type="CAUSAL_LM",
-        modules_to_save=None,  # 명시적으로 None 설정
+        scaling=1.0,
     )
 
 def fix_trainer_state_json(checkpoint_path: str):
@@ -473,11 +398,9 @@ def train(
     valid_path: Optional[str],
     out_dir: str,
     profile: str = "base",          # "dev" | "base" | "long"
-    lora_r: int = 64,
-    lora_alpha: int = 128,
-    lora_dropout: float = 0.05,
-    # 새로 추가된 파라미터들
-    use_augmentation: bool = False,  # 이미지 증강 사용 여부
+    reduction_factor: int = 16,     # Adapter hidden dimension factor
+    adapter_dropout: float = 0.1,   # Adapter dropout
+    # 추가 파라미터들
     max_steps: Optional[int] = None,  # 최대 학습 스텝
     resume_from_checkpoint: Optional[str] = None,  # 체크포인트 재개
 ):
@@ -488,7 +411,6 @@ def train(
     print(f"[CONFIG] Training Configuration")
     print(f"{'='*60}")
     print(f"Profile: {profile}")
-    print(f"Use Augmentation: {use_augmentation}")
     print(f"Max Steps: {max_steps if max_steps else 'Not set (use epochs)'}")
     print(f"Resume from: {resume_from_checkpoint if resume_from_checkpoint else 'Fresh start'}")
     print(f"{'='*60}\n")
@@ -520,9 +442,9 @@ def train(
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
   
-    print("\n[INFO] Configuring LoRA for LLM + Projector (Vision Backbone FROZEN)")
-    lora_cfg = make_lora_config_llm_projector(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
-    model = get_peft_model(model, lora_cfg)
+    print("\n[INFO] Configuring Adapters for LLM + Projector (Vision Backbone FROZEN)")
+    adapter_cfg = make_adapter_config_with_projector(model, reduction_factor=reduction_factor, adapter_dropout=adapter_dropout)
+    model = get_peft_model(model, adapter_cfg)
     
     # 확인
     print("\n[INFO] Verifying trainable parameters:")
@@ -553,10 +475,10 @@ def train(
         print(f"[DATA] Valid samples: {len(valid_df):,}")
     
     # 데이터셋 생성
-    train_ds = AugmentedMMDataset(train_df, processor, augment=use_augmentation)
+    train_ds = MMDataset(train_df, processor)
     eval_ds = None
     if valid_df is not None and not valid_df.empty:
-        eval_ds = AugmentedMMDataset(valid_df, processor, augment=False)
+        eval_ds = MMDataset(valid_df, processor)
     collator = QwenVLDataCollator(pad_token_id=tokenizer.pad_token_id)
 
     profiles = {
@@ -648,13 +570,13 @@ def train(
             with open(adapter_config_path, 'r') as f:
                 config = json.load(f)
                 old_modules = set(config.get('target_modules', []))
-                new_modules = set(lora_cfg.target_modules)
+                new_modules = set(adapter_cfg.target_modules)
                 
                 if old_modules != new_modules:
                     print(f"\n⚠️ WARNING: Module configuration mismatch detected!")
                     print(f"  Old modules: {sorted(old_modules)}")
                     print(f"  New modules: {sorted(new_modules)}")
-                    print("\nThis is expected if switching from LLM-only to LLM+Projector training.")
+                    print("\nThis is expected if switching from LoRA to Adapter or changing target modules.")
                     print("The training will continue with the new configuration.\n")
         
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
@@ -674,17 +596,15 @@ def train(
 
 # ========= CLI (optional) =========
 def build_parser():
-    p = argparse.ArgumentParser(description="Qwen2.5-VL-7B unified multitask fine-tuning (QLoRA)")
+    p = argparse.ArgumentParser(description="Qwen2.5-VL-7B unified multitask fine-tuning (Adapter)")
     p.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
     p.add_argument("--train_path", type=str, required=True)
     p.add_argument("--valid_path", type=str, default=None)
     p.add_argument("--out_dir",   type=str, required=True)
     p.add_argument("--profile",   choices=["dev","base","long"], default="base")
-    p.add_argument("--lora_r", type=int, default=64)
-    p.add_argument("--lora_alpha", type=int, default=128)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
-    # 새로 추가된 arguments
-    p.add_argument("--use_augmentation", action="store_true", help="Use image augmentation")
+    p.add_argument("--reduction_factor", type=int, default=16, help="Adapter reduction factor")
+    p.add_argument("--adapter_dropout", type=float, default=0.1, help="Adapter dropout")
+    # 추가 arguments
     p.add_argument("--max_steps", type=int, default=None, help="Maximum training steps")
     p.add_argument("--resume_from_checkpoint", type=str, default=None, help="Resume from checkpoint")
     return p
@@ -697,10 +617,8 @@ def main():
         valid_path=args.valid_path,
         out_dir=args.out_dir,
         profile=args.profile,
-        lora_r=args.lora_r, 
-        lora_alpha=args.lora_alpha, 
-        lora_dropout=args.lora_dropout,
-        use_augmentation=args.use_augmentation,
+        reduction_factor=args.reduction_factor,
+        adapter_dropout=args.adapter_dropout,
         max_steps=args.max_steps,
         resume_from_checkpoint=args.resume_from_checkpoint,
     )
