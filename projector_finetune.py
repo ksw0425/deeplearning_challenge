@@ -364,39 +364,37 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
     return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
                       bias="none", task_type="CAUSAL_LM")
 
-def find_projector_modules(model):
-    """Vision-Language Projector 모듈만 찾기 (LLM 제외)"""
-    projector_modules = []
-    
-    for name, module in model.named_modules():
-        # visual.merger 관련 Linear 레이어만
-        if 'visual' in name.lower() and 'merger' in name.lower():
-            if isinstance(module, (torch.nn.Linear,)):
-                projector_modules.append(name)
-                print(f"Found projector module: {name}")
-    
-    return projector_modules
-
 def make_lora_config_llm_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """LLM + Projector 동시 학습 (Vision Backbone 제외)"""
+    """LLM + Projector만 학습 (Vision Backbone 완전 제외)"""
     
     target_modules = [
-        # LLM 모듈
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "up_proj", "down_proj", "gate_proj",
+        # === LLM 모듈 (7개) ===
+        "q_proj",      # Query projection
+        "k_proj",      # Key projection  
+        "v_proj",      # Value projection
+        "o_proj",      # Output projection
+        "up_proj",     # FFN up projection
+        "down_proj",   # FFN down projection
+        "gate_proj",   # FFN gate projection
         
-        # Projector 모듈 (merger만)
-        "model.visual.merger.mlp.0",
-        "model.visual.merger.mlp.2",
+        # === Projector 모듈 (2개) ===
+        # Vision-to-Language alignment layers
+        "model.visual.merger.mlp.0",  # First linear layer
+        "model.visual.merger.mlp.2",  # Second linear layer
     ]
     
-    print(f"[INFO] LLM + Projector modules: {len(target_modules)}")
+    print(f"[INFO] LoRA Configuration:")
+    print(f"  - LLM modules: 7 (q,k,v,o,up,down,gate)")
+    print(f"  - Projector modules: 2 (merger.mlp.0, merger.mlp.2)")
+    print(f"  - Vision Backbone: FROZEN (not included)")
+    print(f"  - Total trainable: 9 modules")
+    
     return LoraConfig(
-        r=r, 
-        lora_alpha=alpha, 
-        lora_dropout=dropout, 
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
         target_modules=target_modules,
-        bias="none", 
+        bias="none",
         task_type="CAUSAL_LM"
     )
   
@@ -423,7 +421,7 @@ def train(
     lora_dropout: float = 0.05,
     # 새로 추가된 파라미터들
     train_projector: bool = False,  # Vision-Language Projector 학습 여부
-    train_mode: str = "projector",
+    train_mode: str = "llm_projector",
     use_augmentation: bool = False,  # 이미지 증강 사용 여부
     max_steps: Optional[int] = None,  # 최대 학습 스텝
     resume_from_checkpoint: Optional[str] = None,  # 체크포인트 재개
@@ -468,11 +466,25 @@ def train(
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
   
-    print("[INFO] Configuring LoRA for Projector + LLM")
-    lora_cfg = make_lora_config_llm_projector(model, r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
-    
+    print("\n[INFO] Configuring LoRA for LLM + Projector (Vision Backbone FROZEN)")
+    lora_cfg = make_lora_config_llm_projector_only(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     model = get_peft_model(model, lora_cfg)
-  
+    # 확인
+    print("\n[INFO] Verifying trainable parameters:")
+    trainable = 0
+    frozen = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if 'visual.blocks' in name:
+                print(f"  ⚠️ WARNING: Vision backbone is trainable: {name}")
+            trainable += param.numel()
+        else:
+            frozen += param.numel()
+    
+    print(f"  - Trainable: {trainable:,} ({trainable/1e6:.1f}M)")
+    print(f"  - Frozen: {frozen:,} ({frozen/1e6:.1f}M)")
+    print(f"  - Percentage: {100*trainable/(trainable+frozen):.2f}%")
+    
     # Data
     train_df = read_any(train_path)
     valid_df = read_any(valid_path) if valid_path else None
