@@ -364,41 +364,41 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
     return LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules,
                       bias="none", task_type="CAUSAL_LM")
 
-def find_projector_modules(model):
-    """Vision Projector의 Linear 모듈만 찾기 (Backbone 제외)"""
-    projector_modules = []
+def make_lora_config_llm_projector_safe(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
+    """LLM + Projector만 학습 (Vision Backbone 확실히 제외)"""
     
+    target_modules = []
+    
+    # 모든 Linear 모듈 탐색
     for name, module in model.named_modules():
-        if 'visual' in name.lower():
-            # blocks는 제외 (Vision Backbone)
-            if 'blocks' in name.lower():
+        if isinstance(module, torch.nn.Linear):
+            # Vision Backbone (blocks) 제외
+            if 'visual.blocks' in name:
                 continue
-                
-            # merger나 proj 관련만 포함
-            if any(key in name.lower() for key in ['merger', 'proj', 'projector']):
-                if isinstance(module, torch.nn.Linear):
-                    projector_modules.append(name)
-                    print(f"  Found projector: {name}")
+            
+            # LLM 모듈 (visual이 없는 경로)
+            if any(x in name for x in ['q_proj', 'k_proj', 'v_proj', 'o_proj', 
+                                       'up_proj', 'down_proj', 'gate_proj']):
+                if 'visual' not in name:  # LLM 레이어
+                    target_modules.append(name)
+                elif 'merger' in name:  # Projector의 일부
+                    target_modules.append(name)
+            
+            # Projector 모듈 (merger)
+            elif 'visual.merger' in name:
+                target_modules.append(name)
     
-    return projector_modules
-
-def make_lora_config_llm_projector(model, r=64, alpha=128, dropout=0.05) -> LoraConfig:
-    """LLM + Projector만 학습 (Vision Backbone 제외)"""
+    print(f"\n[INFO] Selected {len(target_modules)} modules for LoRA")
+    print("[INFO] Sample modules:")
+    for m in target_modules[:10]:
+        print(f"  - {m}")
     
-    # LLM 기본 모듈 (단순 이름)
-    llm_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                   "up_proj", "down_proj", "gate_proj"]
-    
-    # Projector 모듈 찾기 (전체 경로)
-    projector_modules = find_projector_modules(model)
-    
-    # 합치기
-    target_modules = llm_modules + projector_modules
-    
-    print(f"\n[INFO] LoRA Configuration:")
-    print(f"  - LLM modules (pattern): {llm_modules}")
-    print(f"  - Projector modules (exact): {len(projector_modules)} found")
-    print(f"  - Total targets: {len(target_modules)}")
+    # Vision Backbone이 포함되었는지 확인
+    backbone_count = sum(1 for m in target_modules if 'visual.blocks' in m)
+    if backbone_count > 0:
+        print(f"⚠️ WARNING: {backbone_count} backbone modules included!")
+    else:
+        print("✓ Vision Backbone excluded successfully")
     
     return LoraConfig(
         r=r,
