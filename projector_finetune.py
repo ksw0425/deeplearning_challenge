@@ -367,36 +367,15 @@ def make_lora_config(r=64, alpha=128, dropout=0.05, target_modules: Optional[Lis
 def make_lora_config_llm_projector(r=64, alpha=128, dropout=0.05) -> LoraConfig:
     """LLM + Projector만 학습 (Vision Backbone 제외)"""
     
-    # 정규표현식으로 정확히 매칭
     target_modules = [
-        # LLM layers만 (visual 제외)
-        r"^model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj$",
-        r"^model\.layers\.\d+\.mlp\.(up|down|gate)_proj$",
+        # LLM
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "up_proj", "down_proj", "gate_proj",
         
-        # Projector만
-        r"^model\.visual\.merger\.mlp\.(0|2)$",
-    ]
-    
-    # 또는 명시적 리스트
-    target_modules = []
-    
-    # LLM 레이어 (예: 28개 레이어)
-    for i in range(28):  # Qwen2.5-7B는 28 layers
-        target_modules.extend([
-            f"model.layers.{i}.self_attn.q_proj",
-            f"model.layers.{i}.self_attn.k_proj",
-            f"model.layers.{i}.self_attn.v_proj",
-            f"model.layers.{i}.self_attn.o_proj",
-            f"model.layers.{i}.mlp.up_proj",
-            f"model.layers.{i}.mlp.down_proj",
-            f"model.layers.{i}.mlp.gate_proj",
-        ])
-    
-    # Projector
-    target_modules.extend([
+        # Projector
         "model.visual.merger.mlp.0",
         "model.visual.merger.mlp.2",
-    ])
+    ]
     
     print(f"[INFO] Target modules: {len(target_modules)}")
     
