@@ -467,7 +467,7 @@ def train(
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
   
     print("\n[INFO] Configuring LoRA for LLM + Projector (Vision Backbone FROZEN)")
-    lora_cfg = make_lora_config_llm_projector_only(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+    lora_cfg = make_lora_config_llm_projector(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
     model = get_peft_model(model, lora_cfg)
     # 확인
     print("\n[INFO] Verifying trainable parameters:")
