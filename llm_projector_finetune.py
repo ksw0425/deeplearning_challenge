@@ -392,6 +392,7 @@ def read_any(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 # ========= Train (4.55.2-safe) =========
+# ========= Train (4.55.2-safe) =========
 def train(
     base_model: str,
     train_path: str,
@@ -411,6 +412,8 @@ def train(
     print(f"[CONFIG] Training Configuration")
     print(f"{'='*60}")
     print(f"Profile: {profile}")
+    print(f"Adapter Reduction Factor: {reduction_factor}")
+    print(f"Adapter Dropout: {adapter_dropout}")
     print(f"Max Steps: {max_steps if max_steps else 'Not set (use epochs)'}")
     print(f"Resume from: {resume_from_checkpoint if resume_from_checkpoint else 'Fresh start'}")
     print(f"{'='*60}\n")
