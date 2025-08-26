@@ -549,7 +549,7 @@ def train(
         init_kwargs["tokenizer"] = tokenizer
 
     trainer = Trainer(**init_kwargs)
-    
+    """
     # 초기 validation loss 확인 (경고만, 중단 없음)
     if eval_ds is not None:
         initial_eval = trainer.evaluate()
@@ -560,7 +560,7 @@ def train(
             print(f"\n[INITIAL] Validation Loss: {loss:.4f}")
             if loss > 2.0:
                 print("⚠️ WARNING: Initial validation loss is very high! (continuing anyway)")
-      
+    """
     if resume_from_checkpoint:
         print(f"\n[INFO] Resuming from checkpoint: {resume_from_checkpoint}")
         
