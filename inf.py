@@ -10,7 +10,7 @@ from urllib.request import urlopen, Request
 import csv, json
 from pathlib import Path
 import torch
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForVision2Seq, AutoModelForCausalLM, AutoProcessor
 from peft import PeftModel
 
 # PIL safety knobs
@@ -25,13 +25,15 @@ warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
 # --- 모델 및 경로 설정 ---
 BASE_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 
-# fine-tuning 결과 load
-FT_OUT_DIR = "/content/drive/MyDrive/Colab Notebooks/wook/fine-tuning/datasets/qlora/qlora-out"
-ADAPTER_DIR = f"{FT_OUT_DIR}/checkpoint-4000_backup"
+# LLM+Projector fine-tuning 결과 load
+FT_OUT_DIR = "/content/drive/MyDrive/Colab Notebooks/wook/fine-tuning/datasets/efficient_lora/lora-out"
+# 최종 체크포인트 번호로 변경 필요 (예: checkpoint-5000)
+ADAPTER_DIR = f"{FT_OUT_DIR}/checkpoint-7000"  # 또는 checkpoint-XXXX
 PROC_DIR = FT_OUT_DIR
 
 DTYPE = torch.bfloat16
 
+# 테스트 데이터 경로
 TEST_PATH = "/content/drive/MyDrive/Colab Notebooks/wook/deeplearningchallenge/deep_chal_multitask_dataset_test.parquet"
 OUT_DIR = "/content/drive/MyDrive/Colab Notebooks/wook/output"
 IMG_BASE = "/content"
@@ -101,8 +103,8 @@ Task-specific output rules:
 
 Do not add any explanations, labels, or metadata beyond the specified format for each task.
 """.strip()
-
 print("Configuration and System Prompt are set.")
+print(f"Using adapter from: {ADAPTER_DIR}")
 
 # ==========================
 # Cell 3: Helper Functions
@@ -222,21 +224,44 @@ print("Helper functions are defined.")
 # ==========================
 model, proc = None, None
 if 'model' not in locals() or model is None:
-    print(f"Loading model '{BASE_ID}'...")
-    base = AutoModelForImageTextToText.from_pretrained(
-        BASE_ID, device_map="auto", trust_remote_code=True, torch_dtype=DTYPE
-    )
-    proc = AutoProcessor.from_pretrained(BASE_ID, trust_remote_code=True)
-    tok_files = ["tokenizer.json", "tokenizer.model", "vocab.json"]
-    if any(os.path.exists(os.path.join(FT_OUT_DIR, f)) for f in tok_files):
-        tok = AutoTokenizer.from_pretrained(FT_OUT_DIR, trust_remote_code=True, use_fast=False)
-        proc.tokenizer = tok
-    if ADAPTER_DIR:
-        model = PeftModel.from_pretrained(base, ADAPTER_DIR, is_trainable=False).eval()
+    print(f"Loading base model '{BASE_ID}'...")
+    
+    # 학습 시와 동일한 방식으로 base model 로드
+    try:
+        base = AutoModelForVision2Seq.from_pretrained(
+            BASE_ID, 
+            device_map="auto", 
+            trust_remote_code=True, 
+            torch_dtype=DTYPE
+        )
+        print("Loaded as Vision2Seq model")
+    except Exception as e1:
+        try:
+            base = AutoModelForCausalLM.from_pretrained(
+                BASE_ID, 
+                device_map="auto", 
+                trust_remote_code=True, 
+                torch_dtype=DTYPE
+            )
+            print("Loaded as CausalLM model")
+        except Exception as e2:
+            raise RuntimeError(f"Failed to load base model: {e1} / {e2}")
+    
+    # Processor는 fine-tuned 디렉토리에서 로드 (학습 시 저장된 것)
+    print(f"Loading processor from '{PROC_DIR}'...")
+    proc = AutoProcessor.from_pretrained(PROC_DIR, trust_remote_code=True)
+    
+    # Adapter 로드
+    if ADAPTER_DIR and os.path.exists(ADAPTER_DIR):
+        print(f"Loading adapter from '{ADAPTER_DIR}'...")
+        model = PeftModel.from_pretrained(base, ADAPTER_DIR, is_trainable=False)
+        print("Adapter loaded successfully")
     else:
+        print(f"Warning: Adapter directory '{ADAPTER_DIR}' not found, using base model only")
         model = base
+    
     model = model.eval()
-    print("Model and processor loaded.")
+    print("Model and processor loaded and set to evaluation mode.")
 else:
     print("Model and processor are already loaded.")
 
@@ -265,6 +290,7 @@ def infer_one(model, proc, task: str, input_type: str, the_input, question: str 
     kwargs = dict(text=[text], return_tensors="pt", padding=True)
     if images is not None:
         kwargs["images"] = images
+    
     batch = proc(**kwargs)
     device = next(model.parameters()).device
     for k, v in list(batch.items()):
@@ -275,7 +301,8 @@ def infer_one(model, proc, task: str, input_type: str, the_input, question: str 
     out_ids = model.generate(
         **batch,
         do_sample=bool(TEMPERATURE and TEMPERATURE > 0.0),
-        temperature=TEMPERATURE, top_p=TOP_P,
+        temperature=TEMPERATURE, 
+        top_p=TOP_P,
         max_new_tokens=MAX_NEW_TOKENS,
         pad_token_id=proc.tokenizer.eos_token_id,
         eos_token_id=proc.tokenizer.eos_token_id,
@@ -289,18 +316,23 @@ print("Inference function is defined.")
 # ==========================
 # Cell 6: Load Data & Run Inference
 # ==========================
-#df = pd.read_parquet(TEST_PATH)
-df = pd.read_parquet(MYTEST_PATH)
+print(f"\nLoading test data from '{TEST_PATH}'...")
+df = pd.read_parquet(TEST_PATH)
 
+# Handle column name typo if exists
 if "input_type" not in df.columns and "input_tpye" in df.columns:
     df = df.rename(columns={"input_tpye": "input_type"})
+    print("Fixed column name 'input_tpye' -> 'input_type'")
+
 df = df.reset_index(drop=True)
 df.insert(0, "id", df.index.astype(str))
 
 print(f"Total rows to process: {len(df):,}")
+print(f"Tasks: {df['task'].value_counts().to_dict()}\n")
 
+# Run inference
 results = []
-for i, row in tqdm(df.iterrows(), total=len(df)):
+for i, row in tqdm(df.iterrows(), total=len(df), desc="Inference"):
     output = infer_one(
         model,
         proc,
@@ -310,10 +342,15 @@ for i, row in tqdm(df.iterrows(), total=len(df)):
         question=row.get("question", "")
     )
     results.append({"id": str(row["id"]), "output": output})
+    
+    # Print sample outputs for debugging (first 3)
+    if i < 3:
+        print(f"\nSample {i}:")
+        print(f"  Task: {row['task']}")
+        print(f"  Output preview: {output[:100]}...")
 
 submission_df = pd.DataFrame(results)
-print("\nInference complete.")
-submission_df.head()
+print("\n✓ Inference complete.")
 
 # ==========================
 # Cell 7: Save and Verify Submission
@@ -321,10 +358,14 @@ submission_df.head()
 os.makedirs(OUT_DIR, exist_ok=True)
 submission_path = os.path.join(OUT_DIR, "submission.csv")
 
+print(f"\nSaving submission to '{submission_path}'...")
 safe_to_csv_utf8(submission_df, submission_path)
+
 try:
     assert_submission_utf8_ok(submission_path)
+    print("✓ Submission file verification passed")
 except AssertionError as e:
-    print(f"Verification failed: {e}")
+    print(f"⚠ Verification failed: {e}")
 
-print(f"\nSubmission file saved to: {submission_path}")
+print(f"\n✅ Submission file saved to: {submission_path}")
+print(f"Total predictions: {len(submission_df)}")
