@@ -34,7 +34,7 @@ DTYPE = torch.bfloat16
 TEST_PATH = "/content/drive/MyDrive/Colab Notebooks/wook/deeplearningchallenge/deep_chal_multitask_dataset_test.parquet"
 OUT_DIR = "/content/drive/MyDrive/Colab Notebooks/wook/output"
 IMG_BASE = "/content"
-URL_TIMEOUT = 5
+URL_TIMEOUT = 20
 MAX_SIDE_HARD = 3500
 
 # --- 이미지 및 생성 설정 ---
@@ -43,66 +43,92 @@ MAX_NEW_TOKENS = 512
 TEMPERATURE = 0.2
 TOP_P = 0.9
 
-# --- 시스템 프롬프트 ---
-SYSTEM_PROMPT = """
-You are a unified vision–language inference assistant for five tasks:
-[captioning, vqa, summarization, text_qa, math_reasoning].
+# --- Task별 완전히 독립된 시스템 프롬프트 ---
+TASK_PROMPTS = {
+    "captioning": """You are an image captioning specialist. Your task is to describe images accurately.
 
-Always reply in English and output ONLY the answer according to task-specific rules.
-If the answer cannot be determined from the provided input, output exactly: unknown.
+Rules:
+- MUST start with "The image is" or "The image shows"
+- Write 1-3 sentences (100-200 words), neutral and factual tone
+- Describe ONLY what is visible: subjects, colors, composition, background, style
+- Include spatial relations ("in the center", "on the right side", "in the background")
+- For book/magazine covers: include ALL clearly legible text verbatim with original casing/punctuation
+- For illustrations: state style (e.g., "vintage pulp illustration", "digital illustration")
+- Avoid speculation - no invented weapons, blood, locations, dates, brands, or narratives
+- Optionally end with a brief overall impression (e.g., "The image has a futuristic feel")
+- If unable to caption, output: unknown""",
 
-Task-specific output rules:
+    "vqa": """You are a visual question answering specialist. Answer questions about images precisely.
 
-**captioning**:
-- MUST start with "The image is" or "The image shows".
-- 1–3 sentences (100–200 words), neutral and factual.
-- Describe ONLY what is visible: subjects, colors, composition, background, style; include spatial relations (“in the center”, “on the right side”, “in the background”).
-- For book/magazine covers: include ALL clearly legible text (title, author, publisher, tagline) verbatim with original casing/punctuation; if a fragment is partially unreadable, acknowledge unreadability and omit the uncertain part.
-- For illustrations: state a style label such as “vintage pulp illustration”, “digital illustration”, or “cartoon-like”.
-- Avoid speculation (no invented weapons, blood, locations, dates, brands, or narratives).
-- Optionally end with a brief overall impression (e.g., “The image has a futuristic and sci-fi feel to it”).
-
-**vqa**:
-- Output ONLY the extracted text or answer from the image
-- For text extraction: output exactly as shown (preserve capitalization, punctuation)
+Rules:
+- Output ONLY the answer, no explanations
+- For text extraction: preserve exact capitalization and punctuation
 - For yes/no questions: use lowercase 'yes' or 'no'
-- For counting: use digits only
-- For names/titles: preserve exact formatting
-- No additional words or explanations
+- For counting: use digits only (e.g., "5" not "five")
+- For names/titles: preserve exact formatting from the image
+- If the answer cannot be determined, output: unknown""",
 
-**math_reasoning**:
-- Show step-by-step calculation using the format: value = <<calculation>>result
-- Each line should explain one step
-- Use the exact format for calculations: <<operation>>
+    "math_reasoning": """You are a mathematical problem solver. Show your work step by step.
+
+Rules:
+- Show each calculation step using: value = <<calculation>>result
+- Each line explains one step
+- Use exact format for calculations: <<operation>>
 - End with: #### [final_answer]
-- Example format:
-  Mimi has 2 x 12 = <<2*12=24>>24 sea shells.
-  Kyle has 24 x 2 = <<24*2=48>>48 sea shells.
-  Leigh has 48 / 3 = <<48/3=16>>16 sea shells.
-  #### 16
 
-**summarization**:
-- Single paragraph of 140–180 words.
-- Start EXACTLY with “[Act Name] - ” where [Act Name] is copied verbatim from the source.
-- Prefer canonical legislative verbs AS WRITTEN in the source: Amends, Authorizes, Directs, Establishes, Requires, Allows, Provides, Designates, Decreases, Earmarks, Extends.
-- Copy proper nouns, program/account names, agencies, and fiscal years (e.g., FY2000–FY2001) verbatim. Include fees, dollar amounts, headcounts/limits if present.
-- Summarize systematically in this order if available: (1) scope/purpose, (2) appropriations/funding, (3) authorities/requirements, (4) eligibility/coverage, (5) timelines/reporting/oversight, (6) penalties/fees/exemptions.
-- If brief section tags like “(Sec. X)” appear in the source, you MAY include them verbatim.
-- Do NOT invent provisions; do NOT use “TABLE OF CONTENTS” or headings; no quotations.
-- If the act name cannot be determined from the input, output exactly: unknown.
+Example format:
+Mimi has 2 x 12 = <<2*12=24>>24 sea shells.
+Kyle has 24 x 2 = <<24*2=48>>48 sea shells.
+Leigh has 48 / 3 = <<48/3=16>>16 sea shells.
+#### 16
 
-**text_qa**:
-- Return a JSON object with exactly these keys:
+If unable to solve, output: unknown""",
+
+    "summarization": """You are a legislative text summarization specialist. Create concise summaries of legal documents.
+
+Rules:
+- Single paragraph of 140-180 words
+- Start EXACTLY with "[Act Name] - " copying the act name verbatim
+- Use legislative verbs AS WRITTEN: Amends, Authorizes, Directs, Establishes, Requires, Allows, Provides, Designates, Decreases, Earmarks, Extends
+- Copy proper nouns, program names, agencies, fiscal years (e.g., FY2000-FY2001) verbatim
+- Include fees, dollar amounts, headcounts/limits if present
+- Summarize in this order if available:
+  1. Scope/purpose
+  2. Appropriations/funding
+  3. Authorities/requirements
+  4. Eligibility/coverage
+  5. Timelines/reporting/oversight
+  6. Penalties/fees/exemptions
+- Include section tags like "(Sec. X)" if present
+- Do NOT invent provisions or use quotations
+- If act name cannot be determined, output: unknown""",
+
+    "text_qa": """You are a text extraction and question answering specialist. Extract answers from text passages.
+
+Rules:
+- Return ONLY a JSON object with these exact keys:
   {'input_text': [list of answers], 'answer_start': [list of start positions], 'answer_end': [list of end positions]}
 - Extract answers directly from the source text
 - For multiple questions, maintain order correspondence
 - Use exact text spans from the passage
-- Format: valid JSON without any additional text
+- Output valid JSON without any additional text
+- If no answer found, return: {"input_text": [], "answer_start": [], "answer_end": []}"""
+}
 
-Do not add any explanations, labels, or metadata beyond the specified format for each task.
-""".strip()
+# 기본 프롬프트 (task가 정의되지 않은 경우만 사용)
+DEFAULT_PROMPT = """You are a helpful AI assistant. 
+Analyze the input and provide an appropriate response.
+If you cannot determine the answer, output: unknown"""
 
-print("Configuration and System Prompt are set.")
+def get_task_prompt(task: str) -> str:
+    """
+    Task에 맞는 프롬프트를 반환. 각 task는 완전히 독립적인 프롬프트를 사용.
+    """
+    task_lower = (task or "").strip().lower()
+    return TASK_PROMPTS.get(task_lower, DEFAULT_PROMPT)
+
+print("Configuration and Task-Specific Prompts are set.")
+print(f"Available tasks: {list(TASK_PROMPTS.keys())}")
 # ==========================
 # Cell 3: Helper Functions
 # ==========================
@@ -242,7 +268,17 @@ else:
 # ==========================
 @torch.no_grad()
 def infer_one(model, proc, task: str, input_type: str, the_input, question: str = "") -> str:
+    """
+    Task별로 완전히 독립된 프롬프트를 사용하여 추론 수행.
+    각 task는 다른 task의 지시사항을 전혀 참조하지 않음.
+    """
     user_prompt = build_user_prompt(task, input_type, str(the_input), question)
+    
+    # Task별 독립된 시스템 프롬프트 선택
+    system_prompt = get_task_prompt(task)
+    
+    # 디버깅용 (필요시 주석 해제)
+    # print(f"Task: {task} -> Using prompt: {system_prompt[:50]}...")
 
     if (input_type or "text").lower() == "image":
         img = load_image(the_input)
@@ -254,7 +290,7 @@ def infer_one(model, proc, task: str, input_type: str, the_input, question: str 
         images = None
 
     messages = [
-        {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+        {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
         {"role": "user",   "content": user_content},
     ]
 
@@ -269,10 +305,13 @@ def infer_one(model, proc, task: str, input_type: str, the_input, question: str 
             batch[k] = v.to(device)
 
     input_len = batch["input_ids"].shape[1]
+    
+    # 모든 task에 동일한 생성 파라미터 사용
     out_ids = model.generate(
         **batch,
         do_sample=bool(TEMPERATURE and TEMPERATURE > 0.0),
-        temperature=TEMPERATURE, top_p=TOP_P,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
         max_new_tokens=MAX_NEW_TOKENS,
         pad_token_id=proc.tokenizer.eos_token_id,
         eos_token_id=proc.tokenizer.eos_token_id,
@@ -281,7 +320,7 @@ def infer_one(model, proc, task: str, input_type: str, the_input, question: str 
     out = proc.batch_decode(gen_only, skip_special_tokens=True)[0]
     return out.strip()
 
-print("Inference function is defined.")
+print("Modified inference function with task-specific prompts is defined.")
 # ==========================
 # Cell 6: Load Data & Run Inference
 # ==========================
